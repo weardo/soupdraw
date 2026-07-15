@@ -1,4 +1,8 @@
 {
+  "categories": ["social-communication", "photos-music-videos"],
+  "summary": {
+    "en-US": "Draw & annotate on your live camera with hand gestures, inside any video call. On-device: no video, frames, or data ever leave your machine."
+  },
   "version": {
     "license": "MIT",
     "approval_notes": "SoupDraw lets a user draw on their OWN camera feed with hand gestures so their video-call app receives the augmented picture. It is a local compositor. WHY THE PERMISSIONS: it injects a MAIN-world content script on <all_urls> that wraps navigator.mediaDevices.getUserMedia; when the page requests the camera it takes the real stream, draws it plus the user's strokes onto a <canvas>, and returns canvas.captureStream() in its place (this is the only way to inject drawings into an arbitrary call app's camera). On any failure it returns the real, untouched camera. <all_urls> is needed because a call can be on any site. wasm-unsafe-eval is required by the bundled MediaPipe WASM hand model, which runs in an extension-origin iframe (src/offscreen/recognizer.html), not in the page. DATA: there are NO network requests at runtime; no video/frames/data are transmitted, stored remotely, or shared; only settings + the current drawing are saved to storage.local (see PRIVACY.md). MINIFIED CODE: vendor/tasks-vision/* are the unmodified npm distribution files of @mediapipe/tasks-vision (Apache-2.0); vendor/fingerpose/fingerpose.js is Fingerpose (MIT). First-party code in src/ is plain unminified JS. TEST: open the toolbar popup and click 'Practice gestures & calibrate' for a guided camera tutorial.",
