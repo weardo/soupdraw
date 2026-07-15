@@ -24,6 +24,14 @@ network calls at runtime.
 
 <p align="center"><i>The built-in Practice window: a ghost hand shows each gesture on your real feed, and you learn by doing.</i></p>
 
+<p align="center">
+  <img src="docs/screenshots/04-popup.png" width="30%" alt="Popup: arm/disarm, undo/redo, clear, pen, viewer preview, practice" />
+  <img src="docs/screenshots/05-settings.png" width="30%" alt="Setup and appearance settings" />
+  <img src="docs/screenshots/06-gesture-controls.png" width="30%" alt="Rebindable gesture controls" />
+</p>
+
+<p align="center"><i>The toolbar popup: arm/disarm + one-tap actions up top, pen controls, and fully rebindable gestures.</i></p>
+
 ## Gestures (defaults)
 
 | Gesture | Does |
