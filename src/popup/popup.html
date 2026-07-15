@@ -4,18 +4,19 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="stylesheet" href="popup.css" />
-    <title>draw.me</title>
+    <title>SoupDraw</title>
   </head>
   <body>
     <header>
-      <div class="logo">draw<span>.me</span></div>
+      <div class="logo">Soup<span>Draw</span></div>
       <div class="tag">on-device · gesture drawing</div>
     </header>
 
+    <!-- Master switch + the panic control: always first, always reachable. -->
     <section class="row main-toggle">
       <div>
         <div class="label">Augment my camera</div>
-        <div class="hint" id="enabledHint">Off — apps see your real camera</div>
+        <div class="hint" id="enabledHint">Off: apps see your real camera</div>
       </div>
       <label class="switch">
         <input type="checkbox" id="enabled" />
@@ -25,8 +26,8 @@
 
     <section class="row arm-toggle">
       <div>
-        <div class="label">Arm drawing</div>
-        <div class="hint" id="armHint">Disarmed — gestures ignored (safe for calls)</div>
+        <div class="label">Arm drawing <span class="kbd" data-cmd="toggle-draw">Alt+Shift+D</span></div>
+        <div class="hint" id="armHint">Disarmed: gestures ignored (safe for calls)</div>
       </div>
       <label class="switch">
         <input type="checkbox" id="active" />
@@ -34,19 +35,66 @@
       </label>
     </section>
 
-    <section class="gestures-wrap">
-      <div class="section-label">
-        Controls · tap a gesture to rebind
-        <button id="resetBindings" class="linkbtn">Reset to defaults</button>
+    <!-- One-tap actions you reach for mid-call. -->
+    <section class="quick">
+      <div class="row btns">
+        <button id="undo" data-cmd="undo">↶ Undo</button>
+        <button id="redo" data-cmd="redo">↷ Redo</button>
       </div>
-      <div class="gestures" id="gestures"></div>
+      <button id="clear" class="clear">Clear drawing</button>
     </section>
 
+    <!-- Adjusted often while drawing. -->
     <section class="controls">
+      <div class="row">
+        <span class="label">Pen color</span>
+        <div class="swatches" id="swatches"></div>
+      </div>
+
+      <div class="row">
+        <span class="label">Pen size <b id="sizeVal">6</b></span>
+        <input type="range" id="size" min="2" max="24" value="6" />
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="label">Viewer preview</div>
+          <div class="hint">See exactly what viewers see (draw watching this, not the call's mirror)</div>
+        </div>
+        <label class="switch small">
+          <input type="checkbox" id="preview" />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <button id="practice" class="clear">▶ Practice gestures &amp; calibrate</button>
+    </section>
+
+    <!-- Setup & appearance: one click away, not in your face. -->
+    <details class="adv">
+      <summary>Setup &amp; appearance</summary>
+      <div class="adv-body">
+
       <div class="row">
         <span class="label">Mirror (selfie view)</span>
         <label class="switch small">
-          <input type="checkbox" id="mirror" checked />
+          <input type="checkbox" id="mirror" />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="row">
+        <span class="label">Board color</span>
+        <div class="swatches" id="boardSwatches"></div>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="label">Whiteboard (hide camera)</div>
+          <div class="hint">Draw on a blank board instead of your camera feed</div>
+        </div>
+        <label class="switch small">
+          <input type="checkbox" id="hideCamera" />
           <span class="slider"></span>
         </label>
       </div>
@@ -109,31 +157,28 @@
       <div class="row">
         <div>
           <div class="label">Show gesture (debug)</div>
-          <div class="hint">On-screen overlay of what the model detects</div>
+          <div class="hint">On-screen overlay of what the model detects (viewers see it too)</div>
         </div>
         <label class="switch small">
-          <input type="checkbox" id="debug" checked />
+          <input type="checkbox" id="debug" />
           <span class="slider"></span>
         </label>
       </div>
 
-
-      <div class="row">
-        <span class="label">Pen color</span>
-        <div class="swatches" id="swatches"></div>
       </div>
+    </details>
 
-      <div class="row">
-        <span class="label">Pen size <b id="sizeVal">6</b></span>
-        <input type="range" id="size" min="2" max="24" value="6" />
+    <!-- Gesture rebinding: rarely touched, fully tucked away. -->
+    <details class="adv">
+      <summary>Gesture controls · rebind</summary>
+      <div class="adv-body">
+      <div class="section-label">
+        Tap a gesture to change what it does
+        <button id="resetBindings" class="linkbtn">Reset to defaults</button>
       </div>
-
-      <div class="row btns">
-        <button id="undo">↶ Undo</button>
-        <button id="redo">↷ Redo</button>
+      <div class="gestures" id="gestures"></div>
       </div>
-      <button id="clear" class="clear">Clear drawing</button>
-    </section>
+    </details>
 
     <section class="status" id="status">
       <div class="dot" id="dot"></div>
@@ -141,9 +186,9 @@
     </section>
 
     <footer>
-      <b>Arm drawing</b> only when you want to annotate — press
-      <b>Alt+Shift+D</b> to arm/disarm hands-free. Disarm before a call so
-      gestures aren't interpreted while you talk.
+      <b>Arm drawing</b> only when you want to annotate. Press
+      <span class="kbd" data-cmd="toggle-draw">Alt+Shift+D</span> to arm/disarm
+      hands-free. Disarm before you talk so gestures aren't interpreted mid-call.
     </footer>
 
     <script src="../page/bindings.js"></script>

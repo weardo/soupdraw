@@ -1,4 +1,4 @@
-// draw.me — test harness driver. Calls getUserMedia like a call app would.
+// SoupDraw — test harness driver. Calls getUserMedia like a call app would.
 const v = document.getElementById("v");
 const log = document.getElementById("log");
 
@@ -11,7 +11,7 @@ const log = document.getElementById("log");
   const h = document.createElement("h2");
   h.textContent = "Gestures";
   el.appendChild(h);
-  for (const row of b.legend()) {
+  for (const row of b.legend().filter((r) => r.bound !== "none")) {
     const ico = document.createElement("div");
     ico.className = "ico";
     ico.textContent = row.icon;

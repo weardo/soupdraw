@@ -11,14 +11,83 @@
   window.__drawmeInstalled = true;
 
   // Pure gesture + drawing logic (loaded by engine.js, tested in Node).
-  const { GestureController, Strokes, SwipeDetector, FistClench, UndoHistory, handOpenness, isShake, depthTransform, fivePinch } = window.DrawMeEngine;
+  const { GestureController, Strokes, SwipeDetector, FistClench, DoubleTap, UndoHistory, handOpenness, fingerExtended, isShake, depthTransform, fivePinch } = window.DrawMeEngine;
+  const HISTORY_MODE_MS = 6000; // history mode auto-closes after this much inactivity
 
   // Actions that modify the board continuously (many frames per gesture). An undo
   // entry is committed only when one of these SETTLES, so it's one entry per
   // stroke/erase/drag — not one per frame.
   const MODIFYING = new Set(["draw", "erase", "grab", "grabShape", "transform"]);
   const MAX_HISTORY = 8; // cleared-board thumbnails kept in the side strip
+
+  // Per-user pinch calibration: record YOUR pinched vs open thumb-index ratio and
+  // set the draw thresholds to fit your hand + camera (instead of a global guess).
+  // Each step VALIDATES the pose (orthogonally to the value we're measuring), so
+  // it only records while you're genuinely making it — doing nothing can't "fill"
+  // the bar with junk. `valid(lm, ratio)` → is the pose being made right now.
+  const CALIB_STEPS = [
+    {
+      key: "pinch",
+      prompt: "Pinch thumb + index together — and hold",
+      hint: "touch your thumb and index tips together",
+      reduce: "min",
+      valid: (lm, r) => r != null && r < 0.55, // fingers clearly together
+    },
+    {
+      key: "open",
+      prompt: "Now open your hand wide — and hold",
+      hint: "spread ALL your fingers apart",
+      reduce: "max",
+      valid: (lm, r) => r != null && r > 0.75 && handOpenness(lm) >= 3, // apart AND fingers extended
+    },
+  ];
   const BINDINGS = window.DrawMeBindings; // gesture catalog + default bindings
+
+  // Fingerpose curl classifier for the curl-based poses (victory, fist). Defined
+  // with CURLS ONLY → rotation-invariant (verified). Returns the top gesture name
+  // above threshold, or null. Null if the library didn't load → gestures fall
+  // back to our own finger geometry (see bindings). -> (landmarks) => name|null
+  function makeCurlClassifier() {
+    const FP = window.fp && (window.fp.default || window.fp);
+    if (!FP) return null;
+    try {
+      const { GestureEstimator, GestureDescription, Finger, FingerCurl } = FP;
+      const victory = new GestureDescription("victory");
+      victory.addCurl(Finger.Index, FingerCurl.NoCurl, 1.0);
+      victory.addCurl(Finger.Middle, FingerCurl.NoCurl, 1.0);
+      for (const fg of [Finger.Ring, Finger.Pinky]) {
+        victory.addCurl(fg, FingerCurl.FullCurl, 1.0);
+        victory.addCurl(fg, FingerCurl.HalfCurl, 0.9);
+      }
+      const fist = new GestureDescription("fist");
+      // index + middle must be FULLY curled (a draw-pinch only HALF-curls the
+      // index, so it won't read as a fist and steal erase mid-stroke). Ring/pinky
+      // are looser (they often don't fully close).
+      for (const fg of [Finger.Index, Finger.Middle]) fist.addCurl(fg, FingerCurl.FullCurl, 1.0);
+      for (const fg of [Finger.Ring, Finger.Pinky]) {
+        fist.addCurl(fg, FingerCurl.FullCurl, 1.0);
+        fist.addCurl(fg, FingerCurl.HalfCurl, 0.9);
+      }
+      const est = new GestureEstimator([victory, fist]);
+      return (lm) => {
+        if (!lm || lm.length < 21) return null;
+        try {
+          const found = est.estimate(
+            lm.map((p) => [p.x, p.y, p.z || 0]),
+            8.5,
+          ).gestures;
+          if (!found.length) return null;
+          found.sort((a, b) => b.score - a.score);
+          return found[0].name;
+        } catch (_) {
+          return null;
+        }
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+  const CURL_CLASSIFIER = makeCurlClassifier();
 
   // Which hand (Left/Right) is hand `i`, as the USER perceives it. MediaPipe
   // returns handedness assuming a SELFIE-MIRRORED input, but we feed it the RAW
@@ -48,7 +117,7 @@
   const state = {
     base: null, // moz-extension://<uuid>/  (from the bridge)
     saved: null, // last persisted { strokes, history } (restored on load)
-    settings: { enabled: true, active: true, mirror: true, boost: true, assist: true, debug: true, minimap: true, history: true, spotlight: true, color: "#ff2d55", size: 6, clearNonce: 0, undoNonce: 0, redoNonce: 0, bindings: { ...window.DrawMeBindings.DEFAULT_BINDINGS } },
+    settings: { enabled: true, active: true, mirror: true, preview: false, boost: true, assist: true, debug: false, minimap: true, history: true, spotlight: true, hideCamera: false, boardColor: "#14151a", color: "#ff2d55", size: 6, clearNonce: 0, undoNonce: 0, redoNonce: 0, calibNonce: 0, pinchDown: null, pinchUp: null, bindings: { ...window.DrawMeBindings.DEFAULT_BINDINGS } },
   };
   const active = new Set(); // live Augmentor instances (for live setting updates)
 
@@ -60,15 +129,22 @@
       for (const aug of active) aug.restoreDrawing(state.saved);
       return;
     }
+    // Practice-window only: seed board content so a tutorial step has something to
+    // act on. Inert on real pages (nobody sends "train").
+    if (msg && msg.__drawme === "train" && typeof msg.cmd === "string") {
+      for (const aug of active) aug.trainSeed(msg.cmd);
+      return;
+    }
     if (!msg || msg.__drawme !== "config") return;
     if (msg.base) state.base = msg.base;
-    const prev = { clear: state.settings.clearNonce, undo: state.settings.undoNonce, redo: state.settings.redoNonce };
+    const prev = { clear: state.settings.clearNonce, undo: state.settings.undoNonce, redo: state.settings.redoNonce, calib: state.settings.calibNonce };
     state.settings = { ...state.settings, ...msg.settings };
     for (const aug of active) {
       aug.applySettings(state.settings);
       if (state.settings.clearNonce !== prev.clear) aug.clear();
       if (state.settings.undoNonce !== prev.undo) aug.performUndo();
       if (state.settings.redoNonce !== prev.redo) aug.performRedo();
+      if (state.settings.calibNonce !== prev.calib) aug.startCalibration();
     }
   });
   // Ask the bridge to (re)send config in case it loaded before us.
@@ -81,44 +157,232 @@
     window.postMessage({ __drawme: "disarm" }, "*");
   }
 
-  // ---- MediaPipe Gesture Recognizer (trained model, lazy singleton) ---------
-  // Returns BOTH hand landmarks and a trained gesture label (Closed_Fist,
-  // Open_Palm, Pointing_Up, Victory, Thumb_Up/Down, ILoveYou, None).
-  let recognizerPromise = null;
-  async function getRecognizer() {
-    if (recognizerPromise) return recognizerPromise;
-    recognizerPromise = (async () => {
-      const url = state.base + "vendor/tasks-vision/vision_bundle.mjs";
-      const vision = await import(url);
-      const { GestureRecognizer, FilesetResolver } = vision;
-      const fileset = await FilesetResolver.forVisionTasks(state.base + "vendor/tasks-vision");
-      const opts = {
-        baseOptions: {
-          modelAssetPath: state.base + "vendor/tasks-vision/gesture_recognizer.task",
-        },
-        runningMode: "VIDEO",
-        numHands: 2, // second hand enables the two-fist transform
-        // Low floors so the palm detector still locks onto the hand against a
-        // busy, broad-patterned background (and in dim light). Tracking floor is
-        // a touch higher so it stays on the real hand once found.
-        minHandDetectionConfidence: 0.3,
-        minHandPresenceConfidence: 0.3,
-        minTrackingConfidence: 0.35,
-      };
+  // ---- hand recognizer client (model runs in the ISOLATED world) ------------
+  // The MediaPipe model CANNOT load in this MAIN world on CSP-strict sites (e.g.
+  // Google Meet): dynamic import(), the wasm/model fetches, and WebAssembly
+  // compilation all run in the PAGE's context here, so the PAGE's CSP blocks them.
+  // So `src/content/recognizer.js` runs the model in the isolated content-script
+  // world (governed by OUR extension CSP, which grants 'wasm-unsafe-eval') and we
+  // talk to it over window.postMessage: we send exposure-adjusted frames, it
+  // returns hand landmarks. All gesture + drawing logic stays here in MAIN.
+  const recModel = { ready: false, error: null, stage: null, hands: null, requested: false, requestedAt: 0 };
+
+  // The model lives in an extension iframe (id below) injected by the content
+  // script. We post to its contentWindow directly; it posts results back to us
+  // (window.parent) — handled by the __drawme_rec listener below.
+  function recSend(msg, transfer) {
+    const f = document.getElementById("__drawme_recognizer_host");
+    const w = f && f.contentWindow;
+    if (!w) return false;
+    try {
+      w.postMessage(msg, "*", transfer || []);
+    } catch (_) {
       try {
-        return await GestureRecognizer.createFromOptions(fileset, {
-          ...opts,
-          baseOptions: { ...opts.baseOptions, delegate: "GPU" },
-        });
-      } catch (gpuErr) {
-        console.warn("[draw.me] GPU delegate failed, using CPU", gpuErr);
-        return GestureRecognizer.createFromOptions(fileset, {
-          ...opts,
-          baseOptions: { ...opts.baseOptions, delegate: "CPU" },
-        });
+        w.postMessage(msg, "*");
+      } catch (_) {
+        return false;
       }
-    })();
-    return recognizerPromise;
+    }
+    return true;
+  }
+  function recRequestLoad() {
+    recModel.requested = true;
+    recSend({ __drawme_req: "load" });
+  }
+  function recFree() {
+    // Ask the isolated world to release the WASM arena back to the OS.
+    recModel.ready = false;
+    recModel.requested = false;
+    recModel.stage = null;
+    recSend({ __drawme_req: "free" });
+  }
+
+  window.addEventListener("message", (e) => {
+    const m = e.data;
+    if (!m || typeof m !== "object" || typeof m.__drawme_rec !== "string") return;
+    if (m.__drawme_rec === "hello") {
+      // The iframe host (re)started; if a camera is armed, (re)issue the load and
+      // restart the watchdog clock (now that we know the host is actually alive).
+      recModel.error = null;
+      if (recModel.requested && !recModel.ready) {
+        recModel.requestedAt = performance.now();
+        recSend({ __drawme_req: "load" });
+      }
+      return;
+    }
+    if (m.__drawme_rec === "model") {
+      if (m.status === "ready") {
+        recModel.ready = true;
+        recModel.error = null;
+        recModel.stage = null;
+        recModel.hands = m.hands || null;
+      } else if (m.status === "loading") {
+        recModel.ready = false;
+        recModel.stage = m.stage || null;
+      } else if (m.status === "error") {
+        recModel.ready = false;
+        recModel.error = m.error || "load failed";
+        recModel.stage = null;
+      } else if (m.status === "freed") {
+        recModel.ready = false;
+        recModel.stage = null;
+        recModel.hands = null;
+      }
+      return;
+    }
+    if (m.__drawme_rec === "result") {
+      recModel.hands = m.hands || recModel.hands;
+      for (const aug of active) aug.onRecResult(m.landmarks || [], m.handedness || []);
+    }
+  });
+
+  // ---- viewer preview panel (on-page WYSIWYG of the OUTGOING feed) -----------
+  // Shows EXACTLY what viewers receive — the output canvas, with whatever mirror /
+  // flip-drawing is applied — in a small draggable, resizable, collapsible panel.
+  // Lets you author while watching the TRUE feed instead of the call app's mirror-
+  // flipped self-tile (which is why text looked reversed). It's a separate DOM
+  // overlay, NOT part of the captured stream, so viewers never see it. Shadow DOM
+  // keeps the page's CSS from touching it.
+  const PREVIEW_WIDTHS = [360, 560, 820]; // Small / Medium / Large (px)
+  const preview = { built: false, host: null, wrap: null, canvas: null, ctx: null, sizeIdx: 1, collapsed: false, maximized: false, drag: null };
+
+  // The host is the SINGLE width source. Critical layout props are !important so
+  // neither the page's CSS nor an `all` reset can shrink it; right/bottom are NOT
+  // !important so dragging can move it. Maximized ≈ fill the viewport.
+  function applyPreviewSize() {
+    if (!preview.host) return;
+    const w = preview.maximized
+      ? Math.min(1280, Math.round(window.innerWidth * 0.94))
+      : PREVIEW_WIDTHS[preview.sizeIdx];
+    preview.host.style.setProperty("width", w + "px", "important");
+  }
+
+  function buildPreview() {
+    if (preview.built || !document.body) return;
+    const host = document.createElement("div");
+    host.id = "__drawme_preview_host";
+    host.style.cssText =
+      "position:fixed!important;z-index:2147483646!important;margin:0!important;padding:0!important;" +
+      "border:0!important;box-sizing:border-box!important;max-width:96vw!important;right:16px;bottom:16px;left:auto;top:auto;";
+    const shadow = host.attachShadow({ mode: "open" });
+    const style = document.createElement("style");
+    style.textContent =
+      "*{box-sizing:border-box;margin:0}" +
+      ".wrap{width:100%;font-family:system-ui,-apple-system,sans-serif;background:#0b0c10;border:1px solid #2a2d3a;border-radius:10px;overflow:hidden;box-shadow:0 8px 30px rgba(0,0,0,.5)}" +
+      ".bar{display:flex;align-items:center;gap:6px;padding:6px 8px;background:#14161d;cursor:move;touch-action:none}" +
+      ".dot{width:7px;height:7px;border-radius:50%;background:#35c759;flex:none}" +
+      ".ttl{color:#c9cdda;font-size:12px;font-weight:600;letter-spacing:.02em;flex:1;white-space:nowrap}" +
+      "button{all:unset;color:#8b90a3;font-size:15px;line-height:1;padding:4px 8px;border-radius:5px;cursor:pointer}" +
+      "button:hover{color:#fff;background:#242734}" +
+      "canvas{display:block;width:100%;height:auto;background:#000}" +
+      ".collapsed canvas{display:none}";
+    const wrap = document.createElement("div");
+    wrap.className = "wrap";
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    const ttl = document.createElement("span");
+    ttl.className = "ttl";
+    ttl.textContent = "Viewers see";
+    const bSize = document.createElement("button");
+    bSize.textContent = "⤢";
+    bSize.title = "Cycle size (small / medium / large)";
+    const bMax = document.createElement("button");
+    bMax.textContent = "⛶";
+    bMax.title = "Maximize";
+    const bCollapse = document.createElement("button");
+    bCollapse.textContent = "–";
+    bCollapse.title = "Collapse";
+    const canvas = document.createElement("canvas");
+    bar.append(dot, ttl, bSize, bMax, bCollapse);
+    wrap.append(bar, canvas);
+    shadow.append(style, wrap);
+    document.body.appendChild(host);
+
+    // stopPropagation on the buttons so the bar's drag handler never sees the
+    // press (belt-and-suspenders with the closest() check below).
+    const btnGuard = (e) => e.stopPropagation();
+    [bSize, bMax, bCollapse].forEach((b) => b.addEventListener("pointerdown", btnGuard));
+    bSize.addEventListener("click", () => {
+      preview.maximized = false;
+      bMax.textContent = "⛶";
+      preview.sizeIdx = (preview.sizeIdx + 1) % PREVIEW_WIDTHS.length;
+      applyPreviewSize();
+    });
+    bMax.addEventListener("click", () => {
+      preview.maximized = !preview.maximized;
+      bMax.textContent = preview.maximized ? "❐" : "⛶";
+      if (preview.maximized) {
+        // Anchor to a corner so a viewport-wide panel stays on-screen.
+        host.style.left = "3vw";
+        host.style.top = "3vh";
+        host.style.right = "auto";
+        host.style.bottom = "auto";
+      }
+      applyPreviewSize();
+    });
+    bCollapse.addEventListener("click", () => {
+      preview.collapsed = !preview.collapsed;
+      wrap.classList.toggle("collapsed", preview.collapsed);
+      bCollapse.textContent = preview.collapsed ? "▢" : "–";
+    });
+    // Keep a maximized panel fitting the window as it resizes.
+    window.addEventListener("resize", () => {
+      if (preview.maximized) applyPreviewSize();
+    });
+    // Drag by the title bar (pointer events so it works with a mouse or touch).
+    bar.addEventListener("pointerdown", (e) => {
+      if (e.target.closest("button")) return;
+      preview.drag = { x: e.clientX, y: e.clientY, r: host.getBoundingClientRect() };
+      try {
+        bar.setPointerCapture(e.pointerId);
+      } catch (_) {}
+    });
+    bar.addEventListener("pointermove", (e) => {
+      if (!preview.drag) return;
+      const left = Math.max(4, preview.drag.r.left + (e.clientX - preview.drag.x));
+      const top = Math.max(4, preview.drag.r.top + (e.clientY - preview.drag.y));
+      host.style.left = left + "px";
+      host.style.top = top + "px";
+      host.style.right = "auto";
+      host.style.bottom = "auto";
+    });
+    const endDrag = (e) => {
+      preview.drag = null;
+      try {
+        bar.releasePointerCapture(e.pointerId);
+      } catch (_) {}
+    };
+    bar.addEventListener("pointerup", endDrag);
+    bar.addEventListener("pointercancel", endDrag);
+
+    Object.assign(preview, { built: true, host, wrap, canvas, ctx: canvas.getContext("2d", { alpha: false }) });
+    applyPreviewSize();
+  }
+
+  function showPreview(on) {
+    if (on) {
+      buildPreview();
+      if (preview.host) preview.host.style.display = "";
+    } else if (preview.host) {
+      preview.host.style.display = "none";
+    }
+  }
+
+  // Copy the outgoing frame into the panel (mirrors exactly what viewers get).
+  // Bitmap size tracks the canvas's ACTUAL rendered width so it stays crisp at
+  // whatever size the panel is, and always matches what's displayed.
+  function updatePreview(src) {
+    if (!preview.built || !preview.host || preview.host.style.display === "none" || preview.collapsed) return;
+    if (!src.width || !src.height) return;
+    const w = Math.round(preview.canvas.clientWidth) || PREVIEW_WIDTHS[preview.sizeIdx];
+    const h = Math.round((w * src.height) / src.width);
+    if (preview.canvas.width !== w || preview.canvas.height !== h) {
+      preview.canvas.width = w;
+      preview.canvas.height = h;
+    }
+    preview.ctx.drawImage(src, 0, 0, w, h);
   }
 
   // ---- augmentor: wraps one real stream, produces a canvas stream -----------
@@ -126,7 +390,7 @@
     constructor(realStream, settings) {
       this.real = realStream;
       this.settings = { ...settings };
-      this.ctrl = new GestureController(BINDINGS.GESTURES);
+      this.ctrl = new GestureController(BINDINGS.GESTURES, { curlClassifier: CURL_CLASSIFIER });
       this.strokes = new Strokes();
       this.hist = new UndoHistory({ max: 60 }); // per-action undo/redo
       this.hist.init(this.strokes.snapshot());
@@ -134,13 +398,18 @@
       this.history = []; // cleared-board thumbnails { el, url, strokes } for the strip
       this.histDrag = null; // five-finger drag from the strip: { idx, at } or null
       this.historyHover = -1; // thumbnail highlighted by hovering (grab candidate)
+      this.historyMode = false; // strip interaction is GATED until activated
+      this.historyModeAt = 0; // last activation/interaction (for auto-close)
+      this.historyDragReady = false; // must release the activating pinch before dragging
+      this.pinchPump = new DoubleTap({ window: 1100, minGap: 100 }); // double five-pinch = open history
       this.raf = null;
-      this.recognizer = null;
       this.cursor = null;
       this.gestureName = null;
       this.gestureScore = 0;
       this.curMode = "idle";
       this.curRatio = null;
+      this.curFp = null; // Fingerpose curl label (debug HUD)
+      this.aimPt = null; // two-finger aim point (grab preview), or null
       this.action = null; // current action (from the bindings map)
       this.grabX = null; // one-fist grab: { snap, start } (absolute transform)
       this.xform = null; // two-hand transform: { snap, center, len, angle }
@@ -149,12 +418,23 @@
       this.transformCenter = null; // transform pivot (indicator)
       this.txSpread = null; // last { a, b } two-hand spreads (freeze-on-release)
       this.shapeGrab = null; // move-one-shape: { i, last } (picked item + last pointer)
+      this.selection = []; // indices of marquee-selected shapes (for bulk move)
+      this.selRect = null; // { x0, y0, x1, y1 } while dragging a selection rectangle
+      this.escPath = []; // recent pointer path (wild-shake = escape)
+      this.escFlash = 0; // timestamp of the last shake-escape (for a flash)
+      this.calib = null; // active pinch-calibration state, or null
+      this.calibDone = 0; // timestamp of the last successful calibration (flash)
       this.swipe = new SwipeDetector(); // index-point + swipe = clear all
       this.fistClench = new FistClench(); // double fist-clench = compound gesture
       this.prevGesture = "none"; // resolved gesture last frame (for fire-once actions)
       this.handInfo = null; // { label:"Left"|"Right", score } of the active hand
       this.detHist = []; // recent { t, on } detection samples (rolling "seen %")
       this.hands = []; // current frame's landmark sets (for the hand-glow spotlight)
+      // Latest hand-detection result from the isolated-world recognizer, plus the
+      // in-flight gate so we send one frame at a time (inference-bound, no backlog).
+      this.latestResult = null; // { landmarks, handedness } — lags render by ~1 frame
+      this.recFrameInFlight = false;
+      this.recSentAt = 0;
       this.clearFlash = 0; // timestamp of the last swipe-clear (for a flash)
       this.lastActivity = 0; // last time a gesture actually did something
       this.disarmSent = false; // guard so the idle-disarm message fires once
@@ -180,13 +460,148 @@
       // never brightened — this affects detection only.
       this.inf = document.createElement("canvas");
       this.infCtx = this.inf.getContext("2d", { alpha: false });
+
+      // Tiny canvas for metering scene luminance PER-TILE (spatial auto-exposure).
+      // willReadFrequently: only ~48x36 pixels, read every few frames.
+      this.lum = document.createElement("canvas");
+      this.lum.width = 48;
+      this.lum.height = 36;
+      this.lumCtx = this.lum.getContext("2d", { alpha: false, willReadFrequently: true });
+      this.GX = 8; // exposure grid columns (metered fine; effective coarseness auto-tunes)
+      this.GY = 6; // rows
+      this.gainGrid = new Float32Array(this.GX * this.GY).fill(1.3); // per-tile gain (EMA)
+      this.gainSmooth = new Float32Array(this.GX * this.GY).fill(1.3); // spatially smoothed
+      this.autoContrast = 1.15;
+      this.lumFrame = 0;
+    }
+
+    // Re-meter each tile and ease its brightness gain toward a target, so a dim
+    // REGION gets lifted while a bright one isn't blown out (which would clip the
+    // detail the palm detector needs). Temporal EMA + a 3x3 spatial blur keep the
+    // gain map GRADUAL across the scene (no hard seams). This is what lets a hand
+    // be detected wherever it is, even where the frame is unevenly lit.
+    updateGainGrid() {
+      const s = this.lum;
+      const GX = this.GX;
+      const GY = this.GY;
+      this.lumCtx.drawImage(this.video, 0, 0, s.width, s.height);
+      const d = this.lumCtx.getImageData(0, 0, s.width, s.height).data;
+      const TARGET = 140;
+      let overall = 0;
+      for (let ty = 0; ty < GY; ty++) {
+        for (let tx = 0; tx < GX; tx++) {
+          const x0 = Math.floor((tx * s.width) / GX);
+          const x1 = Math.floor(((tx + 1) * s.width) / GX);
+          const y0 = Math.floor((ty * s.height) / GY);
+          const y1 = Math.floor(((ty + 1) * s.height) / GY);
+          let sum = 0;
+          let n = 0;
+          for (let y = y0; y < y1; y++) {
+            for (let x = x0; x < x1; x++) {
+              const i = (y * s.width + x) * 4;
+              sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+              n++;
+            }
+          }
+          const lum = n ? sum / n : TARGET;
+          overall += lum;
+          const gain = Math.max(0.7, Math.min(2.3, TARGET / Math.max(10, lum)));
+          const idx = ty * GX + tx;
+          this.gainGrid[idx] = this.gainGrid[idx] * 0.85 + gain * 0.15;
+        }
+      }
+      overall /= GX * GY;
+      const rawC = overall < 90 ? 1.3 : overall > 170 ? 1.0 : 1.15;
+      this.autoContrast = this.autoContrast * 0.85 + rawC * 0.15;
+      // AUTO grid coarseness: how many 3x3 blur passes = how UNEVEN the gains are.
+      // Uneven light (high variance) → few passes, keep local detail (fine grid).
+      // Uniform light → more passes, smoother (effectively coarse). Self-tuning.
+      let mean = 0;
+      for (const v of this.gainGrid) mean += v;
+      mean /= this.gainGrid.length;
+      let varc = 0;
+      for (const v of this.gainGrid) varc += (v - mean) * (v - mean);
+      varc /= this.gainGrid.length;
+      const passes = varc > 0.2 ? 2 : varc > 0.06 ? 3 : 4; // smoother → fewer seams
+      this.gainSmooth.set(this.gainGrid);
+      const tmp = this._gainTmp || (this._gainTmp = new Float32Array(GX * GY));
+      for (let p = 0; p < passes; p++) {
+        tmp.set(this.gainSmooth);
+        for (let ty = 0; ty < GY; ty++) {
+          for (let tx = 0; tx < GX; tx++) {
+            let sum = 0;
+            let n = 0;
+            for (let dy = -1; dy <= 1; dy++) {
+              for (let dx = -1; dx <= 1; dx++) {
+                const nx = tx + dx;
+                const ny = ty + dy;
+                if (nx >= 0 && nx < GX && ny >= 0 && ny < GY) {
+                  sum += tmp[ny * GX + nx];
+                  n++;
+                }
+              }
+            }
+            this.gainSmooth[ty * GX + tx] = sum / n;
+          }
+        }
+      }
     }
 
     applySettings(s) {
       this.settings = { ...this.settings, ...s };
+      // apply calibrated pinch thresholds live (null = keep the controller default)
+      if (this.ctrl) {
+        if (typeof s.pinchDown === "number") this.ctrl.DOWN_T = s.pinchDown;
+        if (typeof s.pinchUp === "number") this.ctrl.UP_T = s.pinchUp;
+      }
+      showPreview(!!this.settings.preview); // on-page "what viewers see" panel
     }
     clear() {
       this.clearBoard(performance.now()); // saves a thumbnail + one undo step
+    }
+
+    // Practice-window helper: seed the board so a tutorial step has real content to
+    // act on (a shape to move/select/transform, a scribble to erase, a saved board
+    // in history to restore, etc.). Uses the real Strokes model, so it's genuine.
+    trainSeed(cmd) {
+      const now = performance.now();
+      const aspect = this.canvas.width / Math.max(1, this.canvas.height);
+      const circle = (cx, cy, col) => {
+        this.strokes.begin({ x: cx + 0.07, y: cy }, col, 6);
+        for (let a = 0; a <= Math.PI * 2 + 0.25; a += 0.3) this.strokes.extend({ x: cx + 0.07 * Math.cos(a), y: cy + 0.09 * Math.sin(a) });
+        this.strokes.end(true, aspect, now);
+      };
+      if (cmd === "shapes" || cmd === "select") {
+        this.strokes.clear();
+        this.selection = [];
+        circle(0.4, 0.45, "#0a84ff");
+        circle(0.6, 0.45, "#35c759");
+        if (cmd === "select") this.selection = [0, 1];
+      } else if (cmd === "scribble") {
+        this.strokes.clear();
+        this.selection = [];
+        this.strokes.begin({ x: 0.42, y: 0.42 }, "#ffcc00", 9);
+        for (const [x, y] of [[0.5, 0.55], [0.58, 0.42], [0.5, 0.56], [0.62, 0.5]]) this.strokes.extend({ x, y });
+        this.strokes.end(false, aspect, now);
+      } else if (cmd === "history") {
+        // put a board up, then clear it INTO history so the strip has a thumbnail
+        // (does NOT open history mode — the "open history" step teaches that).
+        this.strokes.clear();
+        this.selection = [];
+        circle(0.5, 0.45, "#ff2d55");
+        this.clearBoard(now);
+        return;
+      } else if (cmd === "historyopen") {
+        // keep-alive for the RESTORE step: hold history mode open + drag-ready.
+        if (this.history.length) {
+          this.historyMode = true;
+          this.historyDragReady = true;
+          this.historyModeAt = now;
+        }
+        return;
+      }
+      this.dirty = true;
+      this.maybeCommit();
     }
 
     async start() {
@@ -204,10 +619,8 @@
       this.canvas.width = this.video.videoWidth || s.width || 640;
       this.canvas.height = this.video.videoHeight || s.height || 480;
 
-      // Kick off model load (non-blocking; frames pass through until ready).
-      getRecognizer()
-        .then((r) => (this.recognizer = r))
-        .catch((err) => console.warn("[draw.me] recognizer load failed", err));
+      // The model loads lazily in the isolated world once drawing is armed (the
+      // loop requests it via recRequestLoad). Frames pass through until it's ready.
 
       const fps = (track && track.getSettings && track.getSettings().frameRate) || 30;
       this.output = this.canvas.captureStream(fps);
@@ -249,20 +662,35 @@
     dispatch(action, g, gesture, twoHand, lms, aspect, ts) {
       if (action !== "draw" && this.strokes.current) this.strokes.end(this.settings.assist, aspect, ts);
       if (action !== "grab") this.grabX = null;
-      if (action !== "grabShape") this.shapeGrab = null;
-      if (action !== "historyDrag") this.finishHistoryDrag(!!lms); // pass hand presence
+      if (action !== "grabShape") {
+        this.shapeGrab = null;
+        if (this.selRect) {
+          // marquee released → finalize which shapes are selected
+          this.selection = this.strokes.selectInRect(this.selRect.x0, this.selRect.y0, this.selRect.x1, this.selRect.y1);
+          this.selRect = null;
+        }
+      }
+      // structural edits invalidate the selection (indices shift / content
+      // changes). NOT transform — it now operates ON the selection.
+      if (action === "draw" || action === "erase" || action === "clear" || action === "grab") {
+        this.selection = [];
+      }
       if (action !== "transform") {
         this.xform = null;
         this.transformA = null;
         this.transformB = null;
         this.txSpread = null;
       }
+      // History drag ended (pinch released → action changed): restore if it was
+      // pulled onto the board, otherwise just drop the floating preview. Without
+      // this, releasing never restored AND the preview never cleared.
+      if (action !== "historyDrag") this.finishHistoryDrag(!!lms);
       if (action !== "erase") this.swipe.reset();
 
       if (action === "draw") this.actDraw(g);
       else if (action === "erase") this.actErase(g, ts);
-      else if (action === "grab") this.actGrab(g, lms, aspect);
-      else if (action === "grabShape") this.actGrabShape(g);
+      else if (action === "grab") this.actGrab(g);
+      else if (action === "grabShape") this.actGrabShape(g, lms, aspect);
       else if (action === "historyDrag") this.actHistoryDrag(g);
       else if (action === "transform") this.actTransform(twoHand, aspect);
       else if (action === "clear") this.actClear(g, ts);
@@ -307,11 +735,20 @@
     // is drawn in drawHistoryDrag. this.histDrag = { idx, at } (at = live point).
     actHistoryDrag(g) {
       if (!g.point) return;
+      // Inert unless history mode is open AND the activating pinch was released.
+      if (!this.historyMode || !this.historyDragReady) {
+        this.cursor = { x: g.point.x, y: g.point.y, mode: "idle", active: false };
+        return;
+      }
+      this.historyModeAt = performance.now(); // interacting → keep mode alive
       if (!this.histDrag) {
-        // Grab the thumbnail you HIGHLIGHTED by hovering (set in drawHistory) —
-        // the pinch does NOT auto-select whatever it happens to be over. Nothing
-        // highlighted → grabs nothing.
-        this.histDrag = { idx: this.historyHover, at: { x: g.point.x, y: g.point.y }, path: [], cancelled: false };
+        // Grab the thumbnail you HIGHLIGHTED by hovering, OR — more forgiving — the
+        // one you pinched directly on (the five-finger cluster is imprecise, so a
+        // generous pad). Nothing under either → grabs nothing.
+        const p = { x: g.point.x, y: g.point.y };
+        let idx = this.historyHover;
+        if (idx < 0) idx = this.historyAt(p, 26);
+        this.histDrag = { idx, from: p, at: { ...p }, path: [], cancelled: false };
       }
       const d = this.histDrag;
       d.at = { x: g.point.x, y: g.point.y };
@@ -336,9 +773,23 @@
       const d = this.histDrag;
       if (!d) return;
       this.histDrag = null;
-      // restore only if dragged OFF the right-side zone onto the board
-      if (present && d.idx >= 0 && this.historyHoverAt(d.at) < 0) {
-        if (this.restoreFromHistory(d.idx)) this.clearFlash = performance.now();
+      // Restore only on a DELIBERATE drag: picked, released off the right-side
+      // zone AND pulled a real distance from where it was grabbed. This stops an
+      // incidental five-pinch near the strip from restoring a board.
+      // Restore = picked + pulled a real distance LEFT onto the board (the strip
+      // is on the right). Decoupled from any edge zone, so a generous hover area
+      // doesn't shrink the restore target.
+      // Restore if it was pulled a real distance LEFT onto the board (the strip is
+      // on the right). Simple + forgiving: not tied to the hover zone, and doesn't
+      // require the hand on the exact release frame (opening the pinch can blip it).
+      // Not dragged left (or dragged back to the strip) → cancel.
+      const moved = Math.hypot(d.at.x - d.from.x, d.at.y - d.from.y);
+      const draggedOntoBoard = d.idx >= 0 && moved > 0.16 && d.from.x - d.at.x > 0.1;
+      if (draggedOntoBoard) {
+        if (this.restoreFromHistory(d.idx)) {
+          this.clearFlash = performance.now();
+          this.historyMode = false; // task done → close history mode
+        }
       }
     }
 
@@ -353,6 +804,114 @@
       this.hist.commit(this.strokes.snapshot());
       this.dirty = false;
       this.persist();
+    }
+
+    // --- pinch calibration (guided; measures YOUR hand) ---
+    startCalibration() {
+      this.calib = { i: 0, t0: 0, samples: [], values: {} };
+    }
+    // Run one calibration frame. Progress is driven by HAND-PRESENT samples, not
+    // wall-clock — so it WAITS for you to raise your hand and hold the pose, and
+    // only advances once it has enough samples. Returns true while calibrating.
+    runCalibration(g, lms, ts) {
+      const cal = this.calib;
+      if (!cal) return false;
+      const NEED = 40; // valid-pose samples needed to lock a value
+      const SETTLE = 10; // ignore the first few valid frames (settling into pose)
+      const step = CALIB_STEPS[cal.i];
+      const poseOk = g.present && typeof g.ratio === "number" && lms && step.valid(lms, g.ratio);
+      cal.poseOk = poseOk;
+      cal.hand = g.present;
+      // ONLY record while the correct pose is actually held. Doing nothing (or the
+      // wrong pose) → not valid → no samples → the bar stays put.
+      if (poseOk) {
+        cal.seen = (cal.seen || 0) + 1;
+        if (cal.seen > SETTLE) cal.samples.push(g.ratio);
+      }
+      cal.progress = Math.min(1, cal.samples.length / NEED);
+      if (cal.samples.length >= NEED) {
+        cal.values[step.key] = step.reduce === "min" ? Math.min(...cal.samples) : Math.max(...cal.samples);
+        cal.i++;
+        cal.samples = [];
+        cal.seen = 0;
+        cal.progress = 0;
+        if (cal.i >= CALIB_STEPS.length) this.finishCalibration();
+      }
+      this.cursor = null;
+      return true;
+    }
+    finishCalibration() {
+      const v = this.calib.values;
+      if (typeof v.pinch === "number" && typeof v.open === "number" && v.open > v.pinch + 0.05) {
+        const gap = v.open - v.pinch;
+        const downT = +(v.pinch + gap * 0.3).toFixed(3); // engage a bit above your pinch
+        const upT = +(v.pinch + gap * 0.6).toFixed(3); // release below your open
+        this.ctrl.DOWN_T = downT;
+        this.ctrl.UP_T = upT;
+        this.calibDone = performance.now();
+        try {
+          window.postMessage(
+            { __drawme: "calibrated", thresholds: { pinchDown: downT, pinchUp: upT } },
+            window.location.origin === "null" ? "*" : window.location.origin,
+          );
+        } catch (_) {
+          /* best-effort persistence */
+        }
+      }
+      this.calib = null;
+    }
+    // On-canvas calibration wizard.
+    drawCalibration(ctx, canvas) {
+      const cal = this.calib;
+      if (!cal) return;
+      const W = canvas.width;
+      const H = canvas.height;
+      ctx.save();
+      ctx.fillStyle = "rgba(10,12,18,0.72)";
+      ctx.fillRect(0, 0, W, H);
+      const step = CALIB_STEPS[cal.i];
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#c9cdda";
+      ctx.font = `${Math.round(W * 0.02)}px system-ui, sans-serif`;
+      ctx.fillText(`Calibrating · step ${cal.i + 1} of ${CALIB_STEPS.length}`, W / 2, H * 0.4);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = `${Math.round(W * 0.033)}px system-ui, sans-serif`;
+      ctx.fillText(step.prompt, W / 2, H * 0.48);
+      // progress bar driven by collected samples; hint if no hand yet
+      const p = cal.progress || 0;
+      const bw = W * 0.4;
+      const bx = W / 2 - bw / 2;
+      const by = H * 0.54;
+      ctx.strokeStyle = "rgba(255,255,255,0.4)";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(bx, by, bw, 12);
+      ctx.fillStyle = "#35c759";
+      ctx.fillRect(bx, by, bw * p, 12);
+      // status: green "detected, hold" only when the correct pose is verified
+      const msg = !cal.hand ? "raise your hand into view" : cal.poseOk ? "✓ pose detected — hold steady" : step.hint;
+      ctx.fillStyle = cal.poseOk ? "rgba(53,199,89,0.95)" : "rgba(255,200,80,0.95)";
+      ctx.font = `${Math.round(W * 0.02)}px system-ui, sans-serif`;
+      ctx.fillText(msg, W / 2, H * 0.6);
+      ctx.restore();
+    }
+
+    // Wild-shake ESCAPE: bail out of any in-progress action — cancel the current
+    // stroke, drop the selection/marquee, release any grab/transform, close
+    // history mode. Committed drawing is untouched (undo covers that).
+    escape() {
+      this.strokes.cancelCurrent();
+      this.selection = [];
+      this.selRect = null;
+      this.shapeGrab = null;
+      this.grabX = null;
+      this.xform = null;
+      this.transformA = null;
+      this.transformB = null;
+      this.txSpread = null;
+      this.histDrag = null;
+      this.historyMode = false;
+      this.dirty = false;
+      this.escFlash = performance.now();
     }
 
     // Commit one undo step once a continuous action has SETTLED (the board
@@ -444,66 +1003,157 @@
       return true;
     }
 
-    // One fist: pan (move) + zoom (depth) + rotate (wrist) the whole canvas,
-    // absolute from a snapshot pivoting on the screen centre (no drift).
-    actGrab(g, lms, aspect) {
-      if (!g.point || !lms) return;
-      const cur = this.handRef(lms, g.point);
+    // Closed fist = PAN the whole board: translate every stroke by the hand's
+    // movement (incremental, so no settled/freeze machinery needed — that gate is
+    // what made the old depth-grab do nothing here). Pure pan, no zoom/rotate.
+    actGrab(g) {
+      if (!g.point) return;
       if (!this.grabX) {
-        this.grabX = { snap: this.strokes.snapshot(), start: { ...cur, center: { x: 0.5, y: 0.5 } } };
-      } else if (g.settled) {
-        // Only commit while the hold is stable. When the fingers start opening
-        // (release), g.settled goes false and we FREEZE — the canvas keeps the
-        // last committed scale/rotation instead of tracking the release motion.
-        const d = depthTransform(this.grabX.start, cur, { rotGain: 1.5 });
-        this.strokes.restore(this.grabX.snap);
-        this.strokes.transformAll(d.scale, d.rotate, this.grabX.start.center, aspect);
-        this.strokes.translateAll(d.pan.x, d.pan.y);
-        this.dirty = true;
+        this.grabX = { last: { x: g.point.x, y: g.point.y } };
+      } else {
+        const dx = g.point.x - this.grabX.last.x;
+        const dy = g.point.y - this.grabX.last.y;
+        if (dx || dy) {
+          this.strokes.translateAll(dx, dy);
+          this.dirty = true;
+        }
+        this.grabX.last = { x: g.point.x, y: g.point.y };
       }
-      this.transformCenter = { x: 0.5, y: 0.5 };
       this.cursor = { x: g.point.x, y: g.point.y, mode: "transform", active: true };
     }
 
-    // Move ONE shape: on gesture-enter, hit-test the pointer to pick the topmost
-    // shape near it; then drag just that shape by the pointer delta. Picking once
-    // (not every frame) means the drag stays with the shape you grabbed even if
-    // the pointer wanders over others — and grabbing empty space does nothing.
-    actGrabShape(g) {
+    // Victory (grab). Decided by where you START:
+    //  • on a SHAPE  → move it (or the whole selection if that shape is selected).
+    //                  THUMB OUT = translate; THUMB BENT = rotate around the group
+    //                  centre by your wrist twist (a modifier, no new gesture).
+    //  • on EMPTY    → drag a marquee rectangle; on release its contents are
+    //                  selected (finalised in dispatch).
+    // Angle the "V" points (base of index+middle → their tips), mirror-aware. It
+    // spans a full range and tracks the hand's rotation crisply — a much better
+    // rotation input than wrist-roll.
+    twoFingerAngle(lms) {
+      const bx = (lms[5].x + lms[9].x) / 2;
+      const by = (lms[5].y + lms[9].y) / 2;
+      const tx = (lms[8].x + lms[12].x) / 2;
+      const ty = (lms[8].y + lms[12].y) / 2;
+      let dx = tx - bx;
+      if (this.settings.mirror) dx = -dx;
+      return Math.atan2(ty - by, dx);
+    }
+    actGrabShape(g, lms, aspect) {
       if (!g.point) return;
+      const angle = lms ? this.twoFingerAngle(lms) : 0;
       if (!this.shapeGrab) {
         const i = this.strokes.hitTest(g.point, 0.05);
-        this.shapeGrab = { i, last: { x: g.point.x, y: g.point.y } };
+        if (i >= 0) {
+          const group = this.selection.includes(i) ? this.selection.slice() : null;
+          const idxs = group || [i];
+          const b = this.strokes.itemsBounds(idxs);
+          const pivot = b ? { x: (b.minx + b.maxx) / 2, y: (b.miny + b.maxy) / 2 } : { x: g.point.x, y: g.point.y };
+          this.shapeGrab = { i, group, marquee: false, last: { x: g.point.x, y: g.point.y }, lastAngle: angle, pivot };
+          if (!group) this.selection = []; // grabbed a shape outside the selection
+        } else {
+          this.shapeGrab = { i: -1, marquee: true, last: { x: g.point.x, y: g.point.y } };
+          this.selRect = { x0: g.point.x, y0: g.point.y, x1: g.point.x, y1: g.point.y };
+          this.selection = [];
+        }
+      } else if (this.shapeGrab.marquee) {
+        this.selRect.x1 = g.point.x;
+        this.selRect.y1 = g.point.y;
       } else if (this.shapeGrab.i >= 0) {
-        this.strokes.translate(this.shapeGrab.i, g.point.x - this.shapeGrab.last.x, g.point.y - this.shapeGrab.last.y);
+        const idxs = this.shapeGrab.group || [this.shapeGrab.i];
+        // Grab = MOVE and ROTATE together (like holding the shape). Rotate by the
+        // V's twist above a small noise floor (so a steady-orientation slide is a
+        // clean move); translate by the hand's movement every frame. No fragile
+        // thumb detection — nothing to occlude.
+        if (lms) {
+          let dA = angle - this.shapeGrab.lastAngle;
+          while (dA > Math.PI) dA -= 2 * Math.PI;
+          while (dA < -Math.PI) dA += 2 * Math.PI;
+          if (Math.abs(dA) > 0.02) {
+            for (const idx of idxs) this.strokes.transformItem(idx, 1, dA, this.shapeGrab.pivot, aspect);
+            this.shapeGrab.lastAngle = angle; // only advance the baseline when we rotate
+          }
+        }
+        const dx = g.point.x - this.shapeGrab.last.x;
+        const dy = g.point.y - this.shapeGrab.last.y;
+        for (const idx of idxs) this.strokes.translate(idx, dx, dy);
+        this.shapeGrab.pivot.x += dx; // rotation pivot rides along with the move
+        this.shapeGrab.pivot.y += dy;
         this.shapeGrab.last = { x: g.point.x, y: g.point.y };
         this.dirty = true;
       }
-      const holding = this.shapeGrab.i >= 0;
-      this.cursor = { x: g.point.x, y: g.point.y, mode: holding ? "move" : "idle", active: holding };
+      const moving = this.shapeGrab.i >= 0;
+      this.cursor = { x: g.point.x, y: g.point.y, mode: moving ? "move" : "idle", active: moving || this.shapeGrab.marquee };
     }
 
     // Two five-finger pinches: distance = scale, angle = rotate, midpoint = pan —
-    // the classic two-point transform, absolute from a fixed-pivot snapshot.
-    // Commits only while BOTH hands hold steadily (tf.settled); freezes on release.
+    // the classic two-point transform, absolute from a fixed-pivot snapshot. The
+    // between-hands angle has FULL range (and you can re-grip), so this is the
+    // proper way to rotate freely — no single-wrist limit. If shapes are SELECTED
+    // it transforms just the SELECTION (around its own centre); else the whole
+    // canvas. Commits only while BOTH hands hold steadily (tf.settled).
     actTransform(tf, aspect) {
       const { pa, pb } = tf;
       const center = { x: (pa.x + pb.x) / 2, y: (pa.y + pb.y) / 2 };
       const len = Math.hypot(pb.x - pa.x, pb.y - pa.y) || 1e-6;
       const angle = Math.atan2(pb.y - pa.y, pb.x - pa.x);
       if (!this.xform) {
-        this.xform = { snap: this.strokes.snapshot(), center, len, angle };
+        const sel = this.selection.slice();
+        const b = sel.length ? this.strokes.itemsBounds(sel) : null;
+        const pivot = b ? { x: (b.minx + b.maxx) / 2, y: (b.miny + b.maxy) / 2 } : center;
+        this.xform = { snap: this.strokes.snapshot(), center, len, angle, sel, pivot };
       } else if (tf.settled !== false) {
         const x0 = this.xform;
         this.strokes.restore(x0.snap);
-        this.strokes.transformAll(len / x0.len, angle - x0.angle, x0.center, aspect);
-        this.strokes.translateAll(center.x - x0.center.x, center.y - x0.center.y);
+        const s = len / x0.len;
+        const r = angle - x0.angle;
+        const px = center.x - x0.center.x;
+        const py = center.y - x0.center.y;
+        if (x0.sel.length) {
+          for (const idx of x0.sel) this.strokes.transformItem(idx, s, r, x0.pivot, aspect);
+          for (const idx of x0.sel) this.strokes.translate(idx, px, py);
+        } else {
+          this.strokes.transformAll(s, r, x0.center, aspect);
+          this.strokes.translateAll(px, py);
+        }
         this.dirty = true;
       }
       this.transformA = pa;
       this.transformB = pb;
-      this.transformCenter = this.xform.center;
+      this.transformCenter = this.xform.pivot || this.xform.center; // pivot = selection centre
       this.cursor = { x: center.x, y: center.y, mode: "transform", active: true };
+    }
+
+    // Marquee rectangle (while dragging a selection) + outlines around the
+    // currently-selected shapes, so you can see the group before/while moving it.
+    drawSelection(ctx, canvas) {
+      const W = canvas.width;
+      const H = canvas.height;
+      ctx.save();
+      if (this.selRect) {
+        const x = Math.min(this.selRect.x0, this.selRect.x1) * W;
+        const y = Math.min(this.selRect.y0, this.selRect.y1) * H;
+        const w = Math.abs(this.selRect.x1 - this.selRect.x0) * W;
+        const h = Math.abs(this.selRect.y1 - this.selRect.y0) * H;
+        ctx.fillStyle = "rgba(120,200,255,0.10)";
+        ctx.fillRect(x, y, w, h);
+        ctx.setLineDash([6, 4]);
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "rgba(120,200,255,0.95)";
+        ctx.strokeRect(x, y, w, h);
+        ctx.setLineDash([]);
+      }
+      if (this.selection.length) {
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "rgba(255,210,60,0.85)"; // amber = selected
+        for (const i of this.selection) {
+          const b = this.strokes.itemsBounds([i]);
+          if (!b) continue;
+          ctx.strokeRect(b.minx * W - 3, b.miny * H - 3, (b.maxx - b.minx) * W + 6, (b.maxy - b.miny) * H + 6);
+        }
+      }
+      ctx.restore();
     }
 
     // Transform indicators: the pivot (white ring), and — for a two-fist
@@ -615,15 +1265,31 @@
       ctx.lineWidth = 1.5;
       ctx.strokeRect(mx(0), my(0), W * s, H * s);
 
-      // the live cursor as a small dot, so you can locate your hand on the map
-      if (this.cursor) {
+      // BOTH hands as dots, so you can locate each on the map. The primary hand
+      // uses its precise gesture cursor (pen colour when active); any other hand
+      // uses its palm centre (cyan). Palm point is mirror-aware, like the strokes.
+      const dot = (px, py, fill) => {
         ctx.beginPath();
-        ctx.arc(mx(this.cursor.x), my(this.cursor.y), 3, 0, Math.PI * 2);
-        ctx.fillStyle = this.cursor.active ? this.settings.color : "rgba(255,255,255,0.9)";
+        ctx.arc(px, py, 3, 0, Math.PI * 2);
+        ctx.fillStyle = fill;
         ctx.fill();
         ctx.lineWidth = 1;
         ctx.strokeStyle = "rgba(0,0,0,0.6)";
         ctx.stroke();
+      };
+      if (this.cursor) dot(mx(this.cursor.x), my(this.cursor.y), this.cursor.active ? this.settings.color : "rgba(255,255,255,0.9)");
+      for (let i = 1; i < this.hands.length; i++) {
+        const lm = this.hands[i];
+        if (!lm || lm.length < 21) continue;
+        let cx = 0;
+        let cy = 0;
+        for (const j of [0, 5, 9, 13, 17]) {
+          cx += lm[j].x;
+          cy += lm[j].y;
+        }
+        cx /= 5;
+        cy /= 5;
+        dot(mx(this.settings.mirror ? 1 - cx : cx), my(cy), "rgba(110,220,255,0.95)");
       }
       ctx.restore();
     }
@@ -669,7 +1335,9 @@
       const W = this.canvas.width;
       const px = pt.x * W;
       const py = pt.y * this.canvas.height;
-      if (px < rects[0].x - W * 0.28) return -1; // must be on the right side (no edge needed)
+      // Generous reach — history mode is already deliberately open, so you can
+      // hover from a comfortable central-right position (no reaching the edge).
+      if (px < rects[0].x - W * 0.42) return -1;
       for (const r of rects) {
         if (py >= r.y - 4 && py <= r.y + r.h + 4) return r.i; // matched by row height
       }
@@ -681,20 +1349,39 @@
         this.historyHover = -1;
         return;
       }
-      // While NOT dragging, the thumbnail your hand is level with (right side of
-      // frame, by row) is the grab candidate — no need to reach the edge. Once
-      // dragging, the picked one stays highlighted.
-      if (!this.histDrag) this.historyHover = this.cursor ? this.historyHoverAt(this.cursor) : -1;
+      // Hover-highlight only when history mode is OPEN and the hand is idle — so
+      // the strip is inert (just visible) during normal drawing.
+      if (!this.histDrag) {
+        this.historyHover =
+          this.historyMode && this.cursor && !this.cursor.active ? this.historyHoverAt(this.cursor) : -1;
+      }
       const dragIdx = this.histDrag && this.histDrag.idx >= 0 ? this.histDrag.idx : -1;
       const hi = dragIdx >= 0 ? dragIdx : this.historyHover;
+      const active = this.historyMode;
+      // dragging a preview back OVER the strip = "release to put it back"
+      const dragBack = dragIdx >= 0 && this.historyHoverAt(this.histDrag.at) >= 0;
       ctx.save();
+      // strip cue: amber "put it back" when a drag hovers it, else green "active"
+      if ((active || dragIdx >= 0) && rects.length) {
+        const top = rects[0];
+        const bot = rects[rects.length - 1];
+        ctx.strokeStyle = dragBack ? "rgba(255,180,60,0.95)" : "rgba(53,199,89,0.9)";
+        ctx.lineWidth = dragBack ? 3 : 2;
+        ctx.strokeRect(top.x - 6, top.y - 6, top.w + 12, bot.y + bot.h - top.y + 12);
+        if (dragBack) {
+          ctx.fillStyle = "rgba(255,180,60,0.95)";
+          ctx.font = `${Math.max(10, Math.round(top.w * 0.16))}px system-ui, sans-serif`;
+          ctx.textAlign = "center";
+          ctx.fillText("↩ put back", top.x + top.w / 2, top.y - 12);
+        }
+      }
       for (const r of rects) {
         const item = this.history[r.i];
         ctx.fillStyle = "rgba(20,21,26,0.6)";
         ctx.fillRect(r.x - 3, r.y - 3, r.w + 6, r.h + 6);
         if (item.el && (item.el.width || item.el.complete)) ctx.drawImage(item.el, r.x, r.y, r.w, r.h);
         const on = r.i === hi;
-        ctx.strokeStyle = on ? "#ffd23f" : "rgba(255,255,255,0.35)";
+        ctx.strokeStyle = on ? "#ffd23f" : active ? "rgba(255,255,255,0.55)" : "rgba(255,255,255,0.28)";
         ctx.lineWidth = on ? 3 : 1;
         ctx.strokeRect(r.x, r.y, r.w, r.h);
       }
@@ -714,13 +1401,17 @@
       const h = Math.round((w * H) / W);
       const x = d.at.x * W - w / 2;
       const y = d.at.y * H - h / 2;
-      const onStrip = this.historyHoverAt(d.at) >= 0; // still on the right side = not yet dropped
+      // green only when a release NOW would actually restore (pulled left onto
+      // the board, far enough) — so the preview never promises a restore it won't do.
+      const moved = Math.hypot(d.at.x - d.from.x, d.at.y - d.from.y);
+      const willRestore = moved > 0.16 && d.from.x - d.at.x > 0.1;
       ctx.save();
       ctx.globalAlpha = 0.9;
       ctx.fillStyle = "rgba(20,21,26,0.9)";
       ctx.fillRect(x - 4, y - 4, w + 8, h + 8);
       ctx.drawImage(item.el, x, y, w, h);
-      ctx.strokeStyle = onStrip ? "rgba(255,255,255,0.5)" : "#35c759"; // green = will restore
+      // green = will restore · amber = over strip (release to put back) · white = neither
+      ctx.strokeStyle = willRestore ? "#35c759" : overBar ? "#ffb43c" : "rgba(255,255,255,0.5)";
       ctx.lineWidth = 3;
       ctx.strokeRect(x, y, w, h);
       ctx.restore();
@@ -749,28 +1440,43 @@
     // Live gesture debug overlay (drawn unmirrored, so text is readable).
     drawHud(ctx, canvas, hand) {
       if (!this.settings.active) {
-        this.hudLines(ctx, canvas, [["STATUS", "disarmed · Alt+Shift+D to draw", "#8b90a3"]]);
+        this.hudLines(ctx, canvas, [["STATUS", "disarmed · arm from the toolbar popup", "#8b90a3"]]);
         return;
       }
-      if (!this.recognizer) {
-        this.hudLines(ctx, canvas, [["DETECT", "loading model…", "#ffcc00"]]);
+      if (!recModel.ready) {
+        const msg = recModel.error
+          ? `model failed: ${recModel.error}`
+          : `loading model…${recModel.stage ? ` (${recModel.stage})` : ""}`;
+        this.hudLines(ctx, canvas, [["DETECT", msg, recModel.error ? "#ff453a" : "#ffcc00"]]);
         return;
       }
       // DETECT = does the model see a HAND at all (separate from any gesture).
       // "seen X%" is the fraction of the last ~1.5s where a hand was found, so a
       // low number = the detector is dropping your hand, not a gesture problem.
       const seen = this.detHist.length ? Math.round((100 * this.detHist.filter((d) => d.on).length) / this.detHist.length) : 0;
+      const nHands = this.hands.length;
       const detect = hand
-        ? ["DETECT", `${this.handInfo ? this.handInfo.label + " hand" : "hand"} · seen ${seen}%`, "#35c759"]
+        ? ["DETECT", `${nHands} hand${nHands > 1 ? "s" : ""} · seen ${seen}%`, nHands >= 2 ? "#35c759" : "#c9cdda"]
         : ["DETECT", `searching… no hand · seen ${seen}%`, "#ffcc00"];
       const action = (this.curMode || "idle").toUpperCase();
       const pinch = this.curRatio != null ? this.curRatio.toFixed(2) : "-";
-      this.hudLines(ctx, canvas, [
+      const lines = [
         detect,
         ["GESTURE", hand ? this.gestureName || "—" : "—", "#ffffff"],
         ["ACTION", action, this.modeColor(this.curMode)],
         ["pinch", `${pinch}  (draw < 0.40)`, "#c9cdda"],
-      ]);
+      ];
+      if (CURL_CLASSIFIER) lines.push(["curl/fp", hand ? this.curFp || "—" : "—", "#8fd4ff"]);
+      if (this.settings.boost) {
+        let gmn = 9;
+        let gmx = 0;
+        for (const v of this.gainSmooth) {
+          gmn = Math.min(gmn, v);
+          gmx = Math.max(gmx, v);
+        }
+        lines.push(["auto-exp", `gain ${gmn.toFixed(2)}–${gmx.toFixed(2)} · ${this.autoContrast.toFixed(2)}c`, "#c9cdda"]);
+      }
+      this.hudLines(ctx, canvas, lines);
     }
     hudLines(ctx, canvas, lines) {
       const s = Math.max(10, Math.round(canvas.width * 0.016));
@@ -838,8 +1544,12 @@
       const H = canvas.height;
       const mir = this.settings.mirror;
       ctx.save();
-      ctx.fillStyle = "rgba(0,0,0,0.26)"; // subtle dim
-      ctx.fillRect(0, 0, W, H);
+      // dim the camera so ink pops — but NOT in whiteboard mode (board's already
+      // solid; dimming it just muddies the colours). Keep the hand glow either way.
+      if (!this.settings.hideCamera) {
+        ctx.fillStyle = "rgba(0,0,0,0.26)";
+        ctx.fillRect(0, 0, W, H);
+      }
       ctx.globalCompositeOperation = "lighter"; // additive → the glow adds light
       for (const lm of this.hands) {
         if (!lm || lm.length < 21) continue;
@@ -875,6 +1585,51 @@
     // The image handed to the model. With low-light boost on, it's a
     // downscaled, brightened/contrast-stretched copy of the frame (helps the
     // hand separate from a dark face); otherwise the raw video element.
+    // A landmark result arrived from the isolated recognizer → cache it and open
+    // the gate for the next frame.
+    onRecResult(landmarks, handedness) {
+      this.recFrameInFlight = false;
+      this.latestResult = { landmarks, handedness };
+    }
+
+    // Ship one exposure-adjusted frame to the isolated-world recognizer. One at a
+    // time (in-flight gate) so inference paces itself and we never build a backlog.
+    // ImageBitmap is transferred (zero-copy) across the world boundary.
+    sendInferenceFrame(ts) {
+      if (this.recFrameInFlight || this.stopped) return;
+      let src;
+      try {
+        src = this.inferenceSource();
+      } catch (_) {
+        return;
+      }
+      if (!src) return;
+      this.recFrameInFlight = true;
+      this.recSentAt = ts;
+      createImageBitmap(src)
+        .then((bmp) => {
+          if (this.stopped) {
+            if (bmp.close) bmp.close();
+            this.recFrameInFlight = false;
+            return;
+          }
+          // Prefer zero-copy transfer; if the world boundary refuses it, fall back
+          // to a structured clone so a strict browser can't stall inference.
+          try {
+            recSend({ __drawme_req: "frame", bitmap: bmp, ts }, [bmp]);
+          } catch (_) {
+            try {
+              recSend({ __drawme_req: "frame", bitmap: bmp, ts });
+            } catch (_) {
+              this.recFrameInFlight = false;
+            }
+          }
+        })
+        .catch(() => {
+          this.recFrameInFlight = false;
+        });
+    }
+
     inferenceSource() {
       if (!this.settings.boost) return this.video;
       const vw = this.video.videoWidth || this.canvas.width;
@@ -887,8 +1642,25 @@
         this.inf.width = iw;
         this.inf.height = ih;
       }
-      this.infCtx.filter = "brightness(1.5) contrast(1.3)";
-      this.infCtx.drawImage(this.video, 0, 0, iw, ih);
+      // Re-meter the tile gains every few frames (adapts as lighting changes).
+      if ((this.lumFrame++ & 3) === 0) this.updateGainGrid();
+      // Paint the model image tile-by-tile, each with its OWN brightness — so a
+      // dim region of the window is lifted and a bright one isn't blown out. The
+      // smoothed grid makes the gain vary gradually between regions. Tiles overlap
+      // 1px so there are no gaps.
+      const GX = this.GX;
+      const GY = this.GY;
+      const c = this.autoContrast.toFixed(3);
+      for (let ty = 0; ty < GY; ty++) {
+        for (let tx = 0; tx < GX; tx++) {
+          const dx = Math.floor((tx * iw) / GX);
+          const dw = Math.floor(((tx + 1) * iw) / GX) - dx + 1;
+          const dy = Math.floor((ty * ih) / GY);
+          const dh = Math.floor(((ty + 1) * ih) / GY) - dy + 1;
+          this.infCtx.filter = `brightness(${this.gainSmooth[ty * GX + tx].toFixed(3)}) contrast(${c})`;
+          this.infCtx.drawImage(this.video, (tx * vw) / GX, (ty * vh) / GY, vw / GX, vh / GY, dx, dy, dw, dh);
+        }
+      }
       this.infCtx.filter = "none";
       return this.inf;
     }
@@ -910,14 +1682,21 @@
         canvas.height = this.video.videoHeight;
       }
 
-      // Layer 0: camera (mirrored for a natural selfie view).
-      ctx.save();
-      if (this.settings.mirror) {
-        ctx.translate(canvas.width, 0);
-        ctx.scale(-1, 1);
+      // Layer 0: camera (mirrored for a natural selfie view) — OR, in whiteboard
+      // mode, a solid board instead of the camera (hand tracking still runs off
+      // the video element; we just don't paint the picture into the output).
+      if (this.settings.hideCamera) {
+        ctx.fillStyle = this.settings.boardColor || "#14151a";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      } else {
+        ctx.save();
+        if (this.settings.mirror) {
+          ctx.translate(canvas.width, 0);
+          ctx.scale(-1, 1);
+        }
+        ctx.drawImage(this.video, 0, 0, canvas.width, canvas.height);
+        ctx.restore();
       }
-      ctx.drawImage(this.video, 0, 0, canvas.width, canvas.height);
-      ctx.restore();
 
       // Reset the idle timer the moment drawing is armed.
       const nowMs = performance.now();
@@ -930,14 +1709,27 @@
       // Gesture inference — ONLY when drawing is armed. Disarmed = clean feed
       // with frozen drawings and zero gesture interpretation (no false positives).
       let hand = false;
-      if (this.settings.active && this.recognizer) {
+      if (this.settings.active) {
         const ts = performance.now();
-        let res = null;
-        try {
-          res = this.recognizer.recognizeForVideo(this.inferenceSource(), ts);
-        } catch (_) {
-          /* transient; skip frame */
+        if (!recModel.ready) {
+          // Not loaded yet → ask the iframe host to load it (once).
+          if (!recModel.requested) {
+            recRequestLoad();
+            recModel.requestedAt = ts;
+          } else if (!recModel.error && !recModel.stage && recModel.requestedAt && ts - recModel.requestedAt > 6000) {
+            // The iframe never even reported "loading" → it didn't load at all
+            // (page likely blocked the extension frame). Surface it, don't spin.
+            recModel.error = "recognizer host did not load (page may block the extension frame)";
+          }
+        } else {
+          // Unstick the in-flight gate if a result never came back (e.g. the model
+          // was freed between send and receive), then send this frame for inference.
+          if (this.recFrameInFlight && ts - this.recSentAt > 400) this.recFrameInFlight = false;
+          this.sendInferenceFrame(ts);
         }
+        // Use the most recent landmarks the isolated recognizer returned (~1 frame
+        // of lag; imperceptible). All gesture logic below is unchanged.
+        const res = this.latestResult;
         const allHands = (res && res.landmarks) || [];
         const lms = allHands[0];
         hand = !!lms;
@@ -950,8 +1742,12 @@
         // Detect the raw gesture. A two-hand gesture overrides the single-hand
         // one. Then the USER's bindings (settings.bindings) decide the action.
         const g = this.ctrl.update(lms, null, this.settings.mirror, ts);
-        let gesture = g.gesture; // pinch | point | fivePinch | none
-        let twoHand = null;
+        this.curFp = g.fp; // Fingerpose curl label (for the debug HUD)
+        if (this.calib && this.runCalibration(g, lms, ts)) {
+          // calibrating: measure only, no drawing/actions this frame
+        } else {
+          let gesture = g.gesture; // pinch | point | fivePinch | none
+          let twoHand = null;
         if (allHands.length >= 2) {
           const pa = handFiveCenter(allHands[0], this.settings.mirror);
           const pb = handFiveCenter(allHands[1], this.settings.mirror);
@@ -979,6 +1775,30 @@
           this.fistClench.reset();
         }
 
+        // Double five-finger-pinch (ONE hand) OPENS history mode — the strip is
+        // inert until then, so the right side stays free for drawing. It
+        // auto-closes after inactivity. `historyDragReady` makes you release the
+        // activating pinch before a drag can begin (so the opener doesn't grab).
+        // RESET (not just feed false) whenever it's not exactly one hand, so a
+        // TWO-hand five-pinch — whose entry flickers 1→2→1 hands — can't fake the
+        // two pulses and open history.
+        if (allHands.length >= 2) {
+          this.pinchPump.reset(); // two hands → can't be a single-hand double-pinch
+        } else {
+          // 1 hand → feed five.on; 0 hands (brief loss) → feed false but DON'T reset,
+          // so a one-frame tracking blip between the two pinches can't wipe it.
+          const fiveOn = allHands.length === 1 && lms ? fivePinch(lms).on : false;
+          if (this.pinchPump.update(fiveOn, ts)) {
+            this.historyMode = true;
+            this.historyModeAt = ts;
+            this.historyDragReady = false;
+          }
+        }
+        if (this.historyMode) {
+          if (gesture !== "fivePinch") this.historyDragReady = true; // released → ok to drag
+          if (!this.histDrag && ts - this.historyModeAt > HISTORY_MODE_MS) this.historyMode = false;
+        }
+
         // Resolved-gesture change edge (fire-once actions like clear read this,
         // since g.changed only reflects the single-hand controller, not overrides).
         this.gestureChanged = gesture !== this.prevGesture;
@@ -986,8 +1806,24 @@
 
         const bindings = { ...BINDINGS.DEFAULT_BINDINGS, ...(this.settings.bindings || {}) };
         const action = bindings[gesture] || null;
-        this.dispatch(action, g, gesture, twoHand, lms, aspect, ts);
-        this.maybeCommit(); // one undo step per settled action
+
+        // Wild shake = ESCAPE (a deliberate violent zigzag; the isShake gate is
+        // far above normal drawing motion). Cancels in-progress state, skips this
+        // frame's action so the shake itself doesn't draw/act.
+        if (g.point) {
+          this.escPath.push({ x: g.point.x, y: g.point.y, t: ts });
+          while (this.escPath.length && ts - this.escPath[0].t > 450) this.escPath.shift();
+        } else {
+          this.escPath = [];
+        }
+        if (g.point && isShake(this.escPath)) {
+          this.escape();
+          this.escPath = [];
+        } else {
+          this.dispatch(action, g, gesture, twoHand, lms, aspect, ts);
+          this.maybeCommit(); // one undo step per settled action
+        }
+        } // end: not calibrating
       } else {
         // Disarmed: finalize any pending stroke; ignore the hand entirely.
         if (this.strokes.current) this.strokes.end(this.settings.assist, canvas.width / canvas.height, nowMs);
@@ -1004,9 +1840,16 @@
         this.txSpread = null;
         this.shapeGrab = null;
         this.fistClench.reset();
+        this.pinchPump.reset();
         this.prevGesture = "none";
         this.hands = [];
         this.histDrag = null; // disarm mid-drag = discard
+        this.historyMode = false;
+        this.selRect = null;
+        this.selection = [];
+        this.escPath = [];
+        this.latestResult = null; // drop stale landmarks so no ghost hand lingers
+        this.recFrameInFlight = false;
       }
 
       // (No idle auto-disarm — drawing stays armed until you toggle it off with
@@ -1016,8 +1859,24 @@
       // (a live "I see your hand" indicator). Armed only, under the drawing.
       if (this.settings.active && this.settings.spotlight) this.drawSpotlight(ctx, canvas);
 
-      // Layer 1: strokes + shapes (highlight the grabbed item).
-      this.strokes.render(ctx, canvas.width, canvas.height, -1);
+      // Layer 1: strokes + shapes. Highlight the shape being grabbed, OR — while
+      // you're LINING UP a two-finger (victory) select with fingers still open —
+      // the shape the aim point is over, so you can see what you'll grab before
+      // the sign completes. Aim point = midpoint of the index + middle tips.
+      let hlIndex = this.shapeGrab && this.shapeGrab.i >= 0 ? this.shapeGrab.i : -1;
+      this.aimPt = null;
+      const lm0 = this.hands[0];
+      if (hlIndex < 0 && lm0 && lm0.length >= 21) {
+        const fe = fingerExtended(lm0);
+        if (fe.index && fe.middle) {
+          const ax = (lm0[8].x + lm0[12].x) / 2;
+          const ay = (lm0[8].y + lm0[12].y) / 2;
+          this.aimPt = { x: this.settings.mirror ? 1 - ax : ax, y: ay };
+          hlIndex = this.strokes.hitTest(this.aimPt, 0.05); // same tolerance grabShape uses
+        }
+      }
+      this.strokes.render(ctx, canvas.width, canvas.height, hlIndex);
+      this.drawSelection(ctx, canvas); // marquee + selected-shape outlines
 
       // Cursor puck: a filled dot for the pen, a dashed circle for the eraser.
       const c = this.cursor;
@@ -1033,11 +1892,8 @@
           ctx.stroke();
           ctx.setLineDash([]);
         } else if (c.mode === "move") {
-          ctx.beginPath();
-          ctx.arc(cx, cy, 11, 0, Math.PI * 2);
-          ctx.lineWidth = 3;
-          ctx.strokeStyle = "rgba(80,200,255,0.95)";
-          ctx.stroke();
+          // No puck — the highlighted shape is the feedback (keeps the grab point
+          // from covering what you're selecting).
         } else if (c.mode === "transform") {
           // Pivot marker for the two-hand scale/rotate.
           ctx.beginPath();
@@ -1082,11 +1938,42 @@
         ctx.restore();
       }
 
+      // Shake-escape feedback: a brief red edge + "cancelled" label.
+      const sinceEsc = performance.now() - this.escFlash;
+      if (this.escFlash && sinceEsc < 600) {
+        ctx.save();
+        ctx.globalAlpha = 1 - sinceEsc / 600;
+        ctx.lineWidth = Math.max(4, Math.round(canvas.width * 0.008));
+        ctx.strokeStyle = "rgba(255,70,70,0.9)";
+        ctx.strokeRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "rgba(255,70,70,0.95)";
+        ctx.font = `${Math.max(16, Math.round(canvas.width * 0.03))}px system-ui, sans-serif`;
+        ctx.textAlign = "center";
+        ctx.fillText("cancelled", canvas.width / 2, canvas.height * 0.14);
+        ctx.restore();
+      }
+
       // Debug HUD: what the model sees + the resolved action (top-left).
       if (this.settings.debug) {
         this.drawFingertips(ctx, canvas);
         this.drawHud(ctx, canvas, hand);
       }
+
+      // Calibration wizard overlay + a brief "calibrated" confirmation.
+      this.drawCalibration(ctx, canvas);
+      const sinceCal = performance.now() - this.calibDone;
+      if (this.calibDone && sinceCal < 1500) {
+        ctx.save();
+        ctx.globalAlpha = 1 - sinceCal / 1500;
+        ctx.fillStyle = "rgba(53,199,89,0.95)";
+        ctx.textAlign = "center";
+        ctx.font = `${Math.round(canvas.width * 0.028)}px system-ui, sans-serif`;
+        ctx.fillText("✓ calibrated", canvas.width / 2, canvas.height * 0.14);
+        ctx.restore();
+      }
+
+      // Mirror the finished frame into the on-page viewer preview (if shown).
+      if (this.settings.preview) updatePreview(this.canvas);
 
       // FPS + status (throttled).
       this.frames++;
@@ -1098,10 +1985,14 @@
       }
       if (now - this.lastStatus > 500) {
         this.lastStatus = now;
+        const hr = this.historyRects(this.canvas)[0]; // top (newest) thumbnail
         postStatus({
           running: true,
           armed: !!this.settings.active,
-          modelReady: !!this.recognizer,
+          modelReady: !!recModel.ready,
+          modelError: recModel.error || null,
+          loadStage: recModel.stage || null,
+          hands: recModel.hands || null,
           hand,
           gesture: this.gestureName,
           drawing: !!(this.cursor && this.cursor.mode === "pen"),
@@ -1109,17 +2000,29 @@
           transforming: !!(this.cursor && this.cursor.mode === "transform"),
           fps: this.fps,
           strokes: this.strokes.list.length,
+          selection: this.selection ? this.selection.length : 0,
+          historyMode: !!this.historyMode,
+          historyTop: hr ? { x: (hr.x + hr.w / 2) / canvas.width, y: (hr.y + hr.h / 2) / canvas.height } : null,
         });
       }
     };
 
-    stop() {
+    // releaseModel=false when we're stopping only to hand off to a fresh
+    // augmentor that will immediately reuse the model (avoids a close+reload).
+    stop(releaseModel = true) {
       if (this.stopped) return;
       this.stopped = true;
       if (this.raf) cancelAnimationFrame(this.raf);
       active.delete(this);
       for (const t of this.real.getTracks()) t.stop();
       this.video.srcObject = null;
+      this.latestResult = null;
+      // Nobody's augmenting a camera anymore → tell the isolated world to hand the
+      // model's memory back to the OS, and hide the on-page preview panel.
+      if (releaseModel && active.size === 0) {
+        recFree();
+        showPreview(false);
+      }
       postStatus({ running: false });
     }
   }
@@ -1134,6 +2037,12 @@
     try {
       if (!state.settings.enabled) return stream;
       if (!constraints || !constraints.video) return stream; // audio-only untouched
+      // One augmented camera at a time. A re-request (preview → call, device
+      // switch, renegotiation) almost always abandons the previous stream WITHOUT
+      // stopping its tracks — so the old augmentor's render loop + model usage
+      // would run forever and pile up. Newest wins: stop the older ones now, but
+      // keep the model alive since this new augmentor is about to reuse it.
+      for (const old of [...active]) old.stop(false);
       const aug = new Augmentor(stream, state.settings);
       active.add(aug);
       if (state.saved) aug.restoreDrawing(state.saved); // apply a save that already arrived

@@ -1,0 +1,21 @@
+MediaPipe
+Copyright 2019-2024 The MediaPipe Authors.
+
+This product includes software developed at Google LLC.
+
+The files in this directory (vendor/tasks-vision/) are the unmodified
+distribution files of the npm package "@mediapipe/tasks-vision"
+(https://www.npmjs.com/package/@mediapipe/tasks-vision), licensed under the
+Apache License, Version 2.0. See the LICENSE file in this directory for the
+full license text.
+
+Bundled files:
+  - vision_bundle.mjs                     (JS API)
+  - vision_wasm_internal.{js,wasm}        (SIMD WASM runtime + glue)
+  - vision_wasm_module_internal.{js,wasm} (module WASM runtime + glue)
+  - vision_wasm_nosimd_internal.{js,wasm} (no-SIMD fallback runtime + glue)
+  - gesture_recognizer.task               (trained hand gesture model)
+
+No source modifications were made. To reproduce, install the package from npm
+at the version pinned in the project's package.json and copy the corresponding
+files from node_modules/@mediapipe/tasks-vision/.

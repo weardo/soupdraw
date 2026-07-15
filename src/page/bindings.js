@@ -17,7 +17,6 @@
   // anchor helpers: where the cursor sits for a gesture (mirror-aware).
   const atIndex = (f, m) => ({ x: m ? 1 - f.indexTip.x : f.indexTip.x, y: f.indexTip.y });
   const atCluster = (f, m) => ({ x: m ? 1 - f.five.center.x : f.five.center.x, y: f.five.center.y });
-  const atPinch = (f, m) => ({ x: m ? 1 - f.pinch.tip.x : f.pinch.tip.x, y: f.pinch.tip.y });
   const atPalm = (f, m) => ({ x: m ? 1 - f.palm.x : f.palm.x, y: f.palm.y }); // fist centre
   const atThumb = (f, m) => ({ x: m ? 1 - f.thumbTip.x : f.thumbTip.x, y: f.thumbTip.y }); // thumb tip
   // midpoint of the index + middle fingertips (the "V" of a Victory sign)
@@ -47,33 +46,42 @@
       label: "Victory (index + middle, joined or spread)",
       priority: 3,
       // A "V"/peace sign: index + middle extended (whether spread apart OR held
-      // together), ring + pinky curled, not pinching. Reliable to detect and
-      // can't fire right after a draw-release (the middle finger is curled then).
+      // together), ring + pinky curled, not pinching. Uses the injected curl
+      // classifier (Fingerpose) when present, else our own finger geometry.
       // Cursor sits at the MIDPOINT of the two fingertips.
       detect: (f) =>
-        f.fingers.index && f.fingers.middle && !f.fingers.ring && !f.fingers.pinky && !f.penDown && !f.five.on,
+        (f.fpOn ? f.fp === "victory" : f.fingers.index && f.fingers.middle && !f.fingers.ring && !f.fingers.pinky) &&
+        !f.penDown &&
+        !f.five.on,
       anchor: atTwoFinger,
     },
     {
       name: "fist",
-      icon: "✊",
+      icon: "👍",
       label: "Fist + thumb out (thumb tip = eraser)",
       priority: 5, // beats pinch, so a fist never reads as draw
-      // All four fingers curled and not a five-finger cluster. A double-clench
-      // still overrides this for one frame (the compound "clear"). Stick your
-      // thumb out and its tip is the eraser point — the thumb doesn't move while
-      // you form a fist, so it's a small, stable, predictable pointer.
-      detect: (f) => !f.fingers.index && !f.fingers.middle && !f.fingers.ring && !f.fingers.pinky && !f.five.on,
+      // Fist with the THUMB OUT → erase at the thumb tip (stable pointer). A
+      // closed fist (thumb tucked) is a separate gesture below. A double-clench
+      // still overrides for one frame (the compound "clear").
+      detect: (f) =>
+        (f.fpOn ? f.fp === "fist" : !f.fingers.index && !f.fingers.middle && !f.fingers.ring && !f.fingers.pinky) &&
+        !f.five.on &&
+        f.thumbOut,
       anchor: atThumb,
     },
     {
-      name: "middlePinch",
-      icon: "🖕🤏",
-      label: "Middle pinch (thumb + middle)",
-      priority: 2,
-      // VR pinch dictionary: thumb touches the MIDDLE finger (index left free).
-      detect: (f) => f.pinch.on && f.pinch.which === "middle" && !f.five.on,
-      anchor: atPinch,
+      name: "closedFist",
+      icon: "✊",
+      label: "Closed fist (thumb tucked in)",
+      priority: 5,
+      // All fingers CURLED AND thumb tucked in → pan/move the whole board. No
+      // !five.on guard: a closed fist bunches the tips like a five-pinch, but the
+      // fingers-curled requirement (vs extended for five-pinch) plus higher
+      // priority is what separates them.
+      detect: (f) =>
+        (f.fpOn ? f.fp === "fist" : !f.fingers.index && !f.fingers.middle && !f.fingers.ring && !f.fingers.pinky) &&
+        !f.thumbOut,
+      anchor: atPalm,
     },
     {
       name: "fivePinch",
@@ -100,7 +108,7 @@
     { name: "none", label: "— nothing —" },
     { name: "draw", label: "Draw" },
     { name: "erase", label: "Erase" },
-    { name: "grabShape", label: "Move one shape" },
+    { name: "grabShape", label: "Move / select shapes" },
     { name: "historyDrag", label: "Drag from history" },
     { name: "grab", label: "Grab · pan · zoom canvas" },
     { name: "transform", label: "Scale · rotate · pan" },
@@ -108,14 +116,15 @@
   ];
 
   // DEFAULT bindings (users override these in the popup → settings.bindings).
-  // Victory (two fingers) grabs a single shape with the cursor between the tips.
-  // Middle-pinch erases. Single-hand five-finger grab (whole-canvas pan/zoom) is
-  // OFF by default — rebind it in the popup anytime. Two-hand transform on.
+  // Victory (two fingers) moves/selects a shape with the cursor between the tips.
+  // A thumb-out fist erases; a closed (thumb-tucked) fist pans the board; the
+  // two-hand five-finger pinch scales/rotates. Every gesture is rebindable.
   const DEFAULT_BINDINGS = {
     pinch: "draw",
     victory: "grabShape",
-    fist: "erase", // a held fist erases; middle-pinch freed (rebind either in popup)
-    middlePinch: "none",
+    fist: "erase", // thumb-out fist erases at the thumb tip
+    closedFist: "grab", // thumb-tucked fist pans/moves the whole board
+
     fivePinch: "historyDrag", // five-finger pinch drags a board out of the history strip
     twoFivePinch: "transform",
     doubleFist: "clear", // clench your fist twice = wipe the board (fires once)
@@ -127,7 +136,9 @@
   // Legend for the CURRENT bindings (defaults to DEFAULT_BINDINGS).
   function legend(bindings) {
     const b = { ...DEFAULT_BINDINGS, ...(bindings || {}) };
-    return ALL.map((g) => ({ name: g.name, icon: g.icon, how: g.label, action: ACTION_LABEL[b[g.name]] || "—" }));
+    // `bound` is the raw action name ("none" if unassigned) so callers can filter
+    // out do-nothing gestures reliably; `action` is the human label.
+    return ALL.map((g) => ({ name: g.name, icon: g.icon, how: g.label, bound: b[g.name] || "none", action: ACTION_LABEL[b[g.name]] || "—" }));
   }
 
   const api = { GESTURES, TWO_HAND, COMPOUND, ALL, ACTIONS_CATALOG, DEFAULT_BINDINGS, legend };

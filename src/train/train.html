@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="train.css" />
+    <title>SoupDraw · Practice</title>
+  </head>
+  <body>
+    <header>
+      <span class="logo">Soup<span>Draw</span></span>
+      <span class="sub">Practice</span>
+      <span id="progress"></span>
+    </header>
+
+    <div id="stage">
+      <!-- shows the REAL augmented feed (camera + your actual drawing), same as a call -->
+      <video id="cam" autoplay playsinline muted></video>
+      <!-- coaching overlay only: ghost hand + flashes -->
+      <canvas id="overlay"></canvas>
+
+      <div id="startCard" class="card">
+        <h1>Learn by doing</h1>
+        <p>
+          This is the real tool. A ghost hand shows each gesture; you do it for
+          real and it advances. Everything runs on your device.
+        </p>
+        <button id="startBtn" class="primary">Start · allow camera</button>
+      </div>
+
+      <div id="doneCard" class="card" hidden>
+        <h1>You're ready 🎉</h1>
+        <p>
+          That's the gesture set. Arm drawing with
+          <span class="kbd" data-cmd="toggle-draw">Alt+Shift+D</span> in any call.
+          Reopen this anytime from the popup.
+        </p>
+        <button id="doneBtn" class="primary">↻ Restart</button>
+      </div>
+    </div>
+
+    <div id="prompt" hidden>
+      <div id="promptIcon"></div>
+      <div id="promptBody">
+        <div id="promptTitle"></div>
+        <div id="promptText"></div>
+      </div>
+      <button id="skipBtn" class="linkbtn">Skip</button>
+    </div>
+
+    <!-- Landmark detector (extension-origin iframe); the pipeline finds it by id. -->
+    <iframe id="__drawme_recognizer_host" src="../offscreen/recognizer.html" hidden></iframe>
+
+    <!-- THE REAL DRAWING ENGINE — the exact scripts the in-call pipeline loads. -->
+    <script src="../page/bindings.js"></script>
+    <script src="../page/engine.js"></script>
+    <script src="../../vendor/fingerpose/fingerpose.js"></script>
+    <script src="../page/pipeline.js"></script>
+
+    <!-- The coaching overlay (ghost hand + step flow). -->
+    <script src="hands.js"></script>
+    <script src="train.js"></script>
+  </body>
+</html>

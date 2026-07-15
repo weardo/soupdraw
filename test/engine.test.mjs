@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
-const { GestureController, Strokes, OneEuro, SwipeDetector, FistClench, UndoHistory, isFist, handOpenness, isShake, recognizeShape, transformPoint, twoHandDelta } = require("../src/page/engine.js");
+const { GestureController, Strokes, OneEuro, SwipeDetector, FistClench, DoubleTap, UndoHistory, isFist, handOpenness, thumbExtended, isShake, recognizeShape, transformPoint, twoHandDelta } = require("../src/page/engine.js");
 const { GESTURES } = require("../src/page/bindings.js");
 
 // The controller is generic — it runs over the gesture DEFINITIONS from
@@ -110,22 +110,6 @@ function fivePinchHand() {
   lm[20] = { x: 0.49, y: 0.27, z: 0 };
   return lm;
 }
-// Middle-finger pinch (VR pinch dictionary): thumb tip touches the MIDDLE
-// fingertip while the index stays extended and free.
-function middlePinchHand() {
-  const lm = Array.from({ length: 21 }, () => ({ x: 0.5, y: 0.5, z: 0 }));
-  lm[0] = { x: 0.5, y: 0.85, z: 0 }; // wrist
-  lm[9] = { x: 0.5, y: 0.65, z: 0 }; // middle MCP -> handSize ~0.2
-  lm[5] = { x: 0.44, y: 0.65, z: 0 };
-  lm[13] = { x: 0.56, y: 0.65, z: 0 };
-  lm[17] = { x: 0.6, y: 0.65, z: 0 };
-  lm[8] = { x: 0.4, y: 0.3, z: 0 }; // index extended, far from thumb
-  lm[12] = { x: 0.5, y: 0.66, z: 0 }; // middle CURLED down to meet the thumb (not extended)
-  lm[4] = { x: 0.5, y: 0.64, z: 0 }; // thumb touching the curled middle tip
-  lm[16] = { x: 0.58, y: 0.78, z: 0 }; // ring curled away
-  lm[20] = { x: 0.62, y: 0.78, z: 0 }; // pinky curled away
-  return lm;
-}
 // Five-finger pinch where each finger sits distance `off` FROM THE THUMB TIP
 // (the metric fivePinch actually uses). handSize (wrist->midMCP) is 0.25, so
 // spread ratio = off / 0.25. Opening the hand = fingers move away from the thumb.
@@ -218,11 +202,6 @@ test("victory works with the two fingers JOINED (together), not only spread", ()
   assert.equal(feed(c, joined, null, false, 5).gesture, "victory");
 });
 
-test("middle pinch = 'middlePinch' gesture (bound to erase)", () => {
-  const c = mkController();
-  assert.equal(feed(c, middlePinchHand(), null, false, 5).gesture, "middlePinch");
-});
-
 test("five-pinch gesture is ROTATION-INVARIANT (any angle works)", () => {
   for (const deg of [0, 45, 90, 137, 180, 270]) {
     const ang = (deg * Math.PI) / 180;
@@ -230,24 +209,24 @@ test("five-pinch gesture is ROTATION-INVARIANT (any angle works)", () => {
   }
 });
 
-// A five-pinch tilted toward the camera foreshortens: the tip-cluster projects
-// back near the palm, so the old depth "reach" gate collapses and the pose used
-// to fall through to draw. Spread-only detection must keep it a five-pinch.
-test("five-pinch survives foreshortening (tilted toward the lens) — not draw", () => {
+// A five-pinch tilted toward the camera foreshortens: all tips collapse to the
+// knuckle line. This pose is indistinguishable from a closed fist in 2D (no
+// finger extension left), so it now reads as closedFist — but the point that
+// matters is it must NEVER fall through to DRAW.
+test("foreshortened five-pinch / closed fist never falls through to draw", () => {
   const lm = Array.from({ length: 21 }, () => ({ x: 0.5, y: 0.5, z: 0 }));
   lm[0] = { x: 0.5, y: 0.9, z: 0 }; // wrist
   lm[9] = { x: 0.5, y: 0.65, z: 0 };
   lm[5] = { x: 0.46, y: 0.65, z: 0 };
   lm[13] = { x: 0.54, y: 0.65, z: 0 };
   lm[17] = { x: 0.58, y: 0.65, z: 0 };
-  // all five tips bunched right at the knuckle line (fingers pointing at camera)
   lm[4] = { x: 0.49, y: 0.66, z: 0 };
   lm[8] = { x: 0.51, y: 0.66, z: 0 };
   lm[12] = { x: 0.5, y: 0.64, z: 0 };
   lm[16] = { x: 0.51, y: 0.67, z: 0 };
   lm[20] = { x: 0.49, y: 0.65, z: 0 };
   const g = feed(mkController(), lm, null, false, 5).gesture;
-  assert.equal(g, "fivePinch", `foreshortened five-pinch stayed '${g}'`);
+  assert.notEqual(g, "pinch", `must not read as draw, got '${g}'`);
 });
 
 test("grab freezes on release: five-pinch settled when held, NOT when opening", () => {
@@ -657,6 +636,13 @@ test("isFist / handOpenness: finger counts", () => {
   assert.equal(handOpenness(null), -1, "no landmarks → -1");
 });
 
+test("fist vs closedFist: thumb-out → 'fist' (erase), thumb-tucked → 'closedFist' (grab)", () => {
+  assert.equal(feed(mkController(), fistHand(), null, false, 5).gesture, "fist"); // thumb out
+  const tucked = fistHand();
+  tucked[4] = { x: 0.52, y: 0.64, z: 0 }; // thumb folded to the palm centre
+  assert.equal(feed(mkController(), tucked, null, false, 5).gesture, "closedFist");
+});
+
 test("FistClench: two clenches (open→fist twice) fire exactly once", () => {
   const f = new FistClench({ window: 900, minGap: 120, settle: 250 });
   let fires = 0;
@@ -772,6 +758,105 @@ test("UndoHistory: past is capped at max", () => {
   assert.equal(h.current, "s5");
 });
 
+// --- Fingerpose integration (curl classifier injected into the controller) ---
+// The engine stays library-free; the browser injects a Fingerpose classifier for
+// the CURL-based poses (victory, fist). Here we build the same classifier from the
+// vendored lib and check it drives the gestures — rotation-invariantly.
+const FP = (() => {
+  const m = require("../vendor/fingerpose/fingerpose.js");
+  return m.default || m;
+})();
+function curlClassifier() {
+  const { GestureEstimator, GestureDescription, Finger, FingerCurl } = FP;
+  const v = new GestureDescription("victory");
+  v.addCurl(Finger.Index, FingerCurl.NoCurl, 1);
+  v.addCurl(Finger.Middle, FingerCurl.NoCurl, 1);
+  for (const f of [Finger.Ring, Finger.Pinky]) {
+    v.addCurl(f, FingerCurl.FullCurl, 1);
+    v.addCurl(f, FingerCurl.HalfCurl, 0.9);
+  }
+  const fi = new GestureDescription("fist");
+  for (const f of [Finger.Index, Finger.Middle]) fi.addCurl(f, FingerCurl.FullCurl, 1);
+  for (const f of [Finger.Ring, Finger.Pinky]) {
+    fi.addCurl(f, FingerCurl.FullCurl, 1);
+    fi.addCurl(f, FingerCurl.HalfCurl, 0.9);
+  }
+  const est = new GestureEstimator([v, fi]);
+  return (lm) => {
+    const g = est.estimate(
+      lm.map((p) => [p.x, p.y, p.z || 0]),
+      8.5,
+    ).gestures.sort((a, b) => b.score - a.score);
+    return g.length ? g[0].name : null;
+  };
+}
+// full-21-joint hand (Fingerpose needs the intermediate PIP/DIP joints)
+function fullHand({ index, middle, ring, pinky }) {
+  const lm = new Array(21);
+  lm[0] = { x: 0.5, y: 0.95, z: 0 };
+  lm[1] = { x: 0.42, y: 0.88, z: 0 };
+  lm[2] = { x: 0.36, y: 0.82, z: 0 };
+  lm[3] = { x: 0.32, y: 0.77, z: 0 };
+  lm[4] = { x: 0.28, y: 0.73, z: 0 };
+  for (const [x, mcp, ext] of [[0.42, 5, index], [0.48, 9, middle], [0.54, 13, ring], [0.6, 17, pinky]]) {
+    const y = 0.68;
+    lm[mcp] = { x, y, z: 0 };
+    const dy = ext ? [-0.09, -0.17, -0.24] : [-0.06, -0.01, 0.04];
+    lm[mcp + 1] = { x, y: y + dy[0], z: 0 };
+    lm[mcp + 2] = { x, y: y + dy[1], z: 0 };
+    lm[mcp + 3] = { x, y: y + dy[2], z: 0 };
+  }
+  return lm;
+}
+const mkFpController = () => new GestureController(GESTURES, { curlClassifier: curlClassifier() });
+
+test("Fingerpose: victory drives the gesture and is ROTATION-INVARIANT", () => {
+  const v = fullHand({ index: true, middle: true, ring: false, pinky: false });
+  for (const deg of [0, 90, 180, 270]) {
+    assert.equal(feed(mkFpController(), rotate(v, deg), null, false, 5).gesture, "victory", `victory @ ${deg}°`);
+  }
+});
+
+test("Fingerpose: a fist drives the 'fist' gesture", () => {
+  const f = fullHand({ index: false, middle: false, ring: false, pinky: false });
+  assert.equal(feed(mkFpController(), f, null, false, 5).gesture, "fist");
+});
+
+test("Fingerpose: fpOn=false (no classifier) falls back to geometry, gestures still work", () => {
+  // the sparse victoryHand fixture works via geometry, not Fingerpose
+  assert.equal(feed(mkController(), victoryHand(), null, false, 5).gesture, "victory");
+});
+
+// --- DoubleTap (double five-finger-pinch → open history mode) ---
+test("DoubleTap: two pulses within the window fire exactly once", () => {
+  const d = new DoubleTap({ window: 800, minGap: 110 });
+  let fires = 0;
+  const step = (a, t) => {
+    if (d.update(a, t)) fires++;
+  };
+  step(false, 0);
+  step(true, 100); // pulse 1
+  step(false, 250);
+  step(true, 400); // pulse 2 → fire
+  step(true, 420); // held → no re-fire
+  assert.equal(fires, 1);
+});
+
+test("DoubleTap: a single held pulse never fires", () => {
+  const d = new DoubleTap({ window: 800 });
+  let fires = 0;
+  if (d.update(true, 0)) fires++;
+  for (let t = 40; t < 1200; t += 40) if (d.update(true, t)) fires++;
+  assert.equal(fires, 0);
+});
+
+test("DoubleTap: two pulses too far apart do NOT fire", () => {
+  const d = new DoubleTap({ window: 500 });
+  d.update(true, 0);
+  d.update(false, 100);
+  assert.equal(d.update(true, 700), false);
+});
+
 // --- shake-to-cancel detector ---
 test("isShake: a fast back-and-forth zigzag reads as a shake", () => {
   const pts = [];
@@ -808,6 +893,54 @@ test("Strokes.extend preserves a genuine trend (a real diagonal is NOT flattened
   const pts = s.current.points;
   assert.ok(Math.abs(pts[1].x - 0.2) < 1e-9 && Math.abs(pts[1].y - 0.2) < 1e-9, "diagonal point 1 intact");
   assert.ok(Math.abs(pts[2].x - 0.3) < 1e-9 && Math.abs(pts[2].y - 0.3) < 1e-9, "diagonal point 2 intact");
+});
+
+// --- thumb state (move vs rotate modifier) ---
+test("thumbExtended: thumb out reads extended, thumb tucked reads bent", () => {
+  // base hand, wrist (0.5,0.9), midMCP (0.5,0.6) → handSize 0.3, palm centre ~mid
+  const base = () => {
+    const lm = Array.from({ length: 21 }, () => ({ x: 0.5, y: 0.5, z: 0 }));
+    lm[0] = { x: 0.5, y: 0.9, z: 0 };
+    lm[5] = { x: 0.44, y: 0.62, z: 0 };
+    lm[9] = { x: 0.5, y: 0.6, z: 0 };
+    lm[13] = { x: 0.56, y: 0.62, z: 0 };
+    lm[17] = { x: 0.62, y: 0.64, z: 0 };
+    return lm;
+  };
+  const out = base();
+  out[4] = { x: 0.2, y: 0.55, z: 0 }; // thumb abducted far to the side
+  assert.equal(thumbExtended(out), true);
+  const tucked = base();
+  tucked[4] = { x: 0.52, y: 0.66, z: 0 }; // thumb folded over the palm centre
+  assert.equal(thumbExtended(tucked), false);
+});
+
+// --- marquee selection + bulk move ---
+test("Strokes.selectInRect returns items whose centre is inside the rect", () => {
+  const s = new Strokes();
+  s.list.push({ kind: "line", color: "#fff", size: 4, a: { x: 0.1, y: 0.1 }, b: { x: 0.2, y: 0.2 } }); // centre ~0.15
+  s.list.push({ kind: "ellipse", color: "#fff", size: 4, cx: 0.5, cy: 0.5, rx: 0.05, ry: 0.05 }); // centre 0.5
+  s.list.push({ kind: "line", color: "#fff", size: 4, a: { x: 0.8, y: 0.8 }, b: { x: 0.9, y: 0.9 } }); // centre ~0.85
+  const sel = s.selectInRect(0.05, 0.05, 0.6, 0.6); // covers items 0 and 1
+  assert.deepEqual(sel, [0, 1]);
+});
+
+test("Strokes.translateItems moves the whole selection together", () => {
+  const s = new Strokes();
+  s.list.push({ kind: "ellipse", color: "#fff", size: 4, cx: 0.2, cy: 0.2, rx: 0.05, ry: 0.05 });
+  s.list.push({ kind: "ellipse", color: "#fff", size: 4, cx: 0.5, cy: 0.5, rx: 0.05, ry: 0.05 });
+  s.translateItems([0, 1], 0.1, -0.05);
+  assert.ok(Math.abs(s.list[0].cx - 0.3) < 1e-9 && Math.abs(s.list[0].cy - 0.15) < 1e-9);
+  assert.ok(Math.abs(s.list[1].cx - 0.6) < 1e-9 && Math.abs(s.list[1].cy - 0.45) < 1e-9);
+});
+
+test("Strokes.itemsBounds spans all selected items", () => {
+  const s = new Strokes();
+  s.list.push({ kind: "line", color: "#fff", size: 4, a: { x: 0.2, y: 0.3 }, b: { x: 0.4, y: 0.3 } });
+  s.list.push({ kind: "ellipse", color: "#fff", size: 4, cx: 0.7, cy: 0.6, rx: 0.1, ry: 0.05 });
+  const b = s.itemsBounds([0, 1]);
+  assert.ok(Math.abs(b.minx - 0.2) < 1e-9 && Math.abs(b.maxx - 0.8) < 1e-9);
+  assert.ok(Math.abs(b.miny - 0.3) < 1e-9 && Math.abs(b.maxy - 0.65) < 1e-9);
 });
 
 // --- single-object transform + pan ---
@@ -876,9 +1009,8 @@ test("depthTransform: rotGain amplifies wrist roll into more rotation", () => {
 
 // --- gesture separation: 2-finger pinch vs 5-finger pinch (the key ask) ---
 const { fivePinch } = require("../src/page/engine.js");
-test("index-pinch / middle-pinch / five-pinch are three distinct gestures", () => {
+test("index-pinch and five-pinch are distinct gestures", () => {
   assert.equal(feed(mkController(), hand(0.04), null, false, 5).gesture, "pinch");
-  assert.equal(feed(mkController(), middlePinchHand(), null, false, 5).gesture, "middlePinch");
   assert.equal(feed(mkController(), fivePinchHand(), null, false, 5).gesture, "fivePinch");
 });
 test("fivePinch tells a 2-finger pinch from a 5-finger pinch", () => {

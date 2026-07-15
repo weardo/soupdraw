@@ -65,6 +65,28 @@
     return { index: ext(5, 8), middle: ext(9, 12), ring: ext(13, 16), pinky: ext(17, 20) };
   }
 
+  // Thumb-tip distance from the palm centre, relative to hand size (rotation-
+  // invariant). Small = tucked/bent, large = out/abducted. The raw signal behind
+  // thumbExtended — surfaced so callers can calibrate the move/rotate threshold.
+  function thumbDist(lm) {
+    const w = lm[0];
+    const mm = lm[9];
+    const hs = Math.hypot(mm.x - w.x, mm.y - w.y) || 1e-3;
+    let cx = 0;
+    let cy = 0;
+    for (const i of [0, 5, 9, 13, 17]) {
+      cx += lm[i].x;
+      cy += lm[i].y;
+    }
+    cx /= 5;
+    cy /= 5;
+    return Math.hypot(lm[4].x - cx, lm[4].y - cy) / hs;
+  }
+  // Is the THUMB out (vs bent in against the palm)? > threshold = out.
+  function thumbExtended(lm, threshold = 0.7) {
+    return thumbDist(lm) > threshold;
+  }
+
   // How many of the four fingers (index/middle/ring/pinky) are extended: 0 = a
   // fist, 4 = wide open. -1 if no hand. The clench detector uses this to tell a
   // CLEAR open hand from a fist, ignoring the noisy 1-2 finger in-between states.
@@ -108,6 +130,33 @@
     cy /= 5;
     const spread = maxD / hs; // worst finger's distance to the thumb tip
     return { on: spread < 0.6, center: { x: cx, y: cy }, spread };
+  }
+
+  // Generic double-tap: a boolean signal pulsed on-off-on within WINDOW ms fires
+  // once (e.g. double five-finger-pinch to open history mode). MIN_GAP debounces
+  // tracking jitter between the two pulses.
+  class DoubleTap {
+    constructor(opts = {}) {
+      this.WINDOW = opts.window ?? 800;
+      this.MIN_GAP = opts.minGap ?? 110;
+      this.was = false;
+      this.taps = [];
+    }
+    reset() {
+      this.was = false;
+      this.taps = [];
+    }
+    update(active, now) {
+      const rising = active && !this.was;
+      this.was = active;
+      if (rising && (!this.taps.length || now - this.taps[this.taps.length - 1] >= this.MIN_GAP)) this.taps.push(now);
+      while (this.taps.length && now - this.taps[0] > this.WINDOW) this.taps.shift();
+      if (this.taps.length >= 2) {
+        this.taps = [];
+        return true;
+      }
+      return false;
+    }
   }
 
   // Compound TEMPORAL gesture: clench the fist TWICE quickly (two open→fist
@@ -279,6 +328,10 @@
   class GestureController {
     constructor(defs = [], opts = {}) {
       this.defs = defs.slice().sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+      // Optional injected curl classifier (landmarks -> gesture name|null), e.g. a
+      // Fingerpose estimator. Kept OUT of the engine so it stays library-free and
+      // Node-testable; the browser passes one in, tests don't (geometry fallback).
+      this.curlClassifier = opts.curlClassifier || null;
       this.current = null; // winning def (or null)
       this.gesture = "none";
       this.penDown = false;
@@ -382,6 +435,11 @@
         indexTip: { x: index.x, y: index.y },
         middleTip: { x: lm[12].x, y: lm[12].y },
         thumbTip: { x: thumb.x, y: thumb.y }, // stays put during a fist → a stable eraser pointer
+        thumbOut: thumbExtended(lm, 0.7), // thumb abducted (out) vs tucked in — for fist variants
+        // Injected curl-classifier label (e.g. Fingerpose): a gesture def can read
+        // `f.fp` when `f.fpOn`, else fall back to its own geometry.
+        fpOn: !!this.curlClassifier,
+        fp: this.curlClassifier ? this.curlClassifier(lm) : null,
         // palm centre (wrist + 4 knuckles): stable even in a fist, so a fist-based
         // action (e.g. erase) has a predictable anchor, not a jittery curled tip.
         palm: {
@@ -454,7 +512,7 @@
       const settled = winner && winner.settled ? !!winner.settled(feat) : false;
       this.lastSeen = now;
       this.lastPoint = point;
-      return { gesture: this.gesture, changed, point, present: true, settled, ratio: feat.ratio };
+      return { gesture: this.gesture, changed, point, present: true, settled, ratio: feat.ratio, fp: feat.fp };
     }
   }
 
@@ -827,6 +885,13 @@
       }
       pts.push({ x: pt.x, y: pt.y });
     }
+    // Discard the in-progress stroke entirely (used by shake-to-escape).
+    cancelCurrent() {
+      if (!this.current) return;
+      const idx = this.list.indexOf(this.current);
+      if (idx !== -1) this.list.splice(idx, 1);
+      this.current = null;
+    }
     // Finish the current stroke. If assist is on and it fits a shape well, the
     // freehand stroke is replaced by the clean shape. If a single stroke doesn't
     // fit, recent strokes (drawn within GROUP_MS) are combined and re-checked —
@@ -906,6 +971,11 @@
     // radii scale (rotating the axes themselves is intentionally ignored).
     // Scale+rotate one item about `center` (aspect-corrected so rotation is true).
     _xform(it, scale, rotateRad, center, aspect) {
+      // Scale the stroke WIDTH with the zoom too, so lines thicken/thin with the
+      // drawing instead of staying a fixed pixel count. Clamped so extreme zooms
+      // don't make strokes vanish or explode. (Applied from a snapshot each frame,
+      // so it's absolute — no runaway accumulation.)
+      if (typeof it.size === "number") it.size = Math.max(0.5, Math.min(80, it.size * scale));
       const tp = (p) => transformPoint(p, scale, rotateRad, center, aspect);
       if (it.kind === "line") {
         it.a = tp(it.a);
@@ -976,6 +1046,57 @@
     // Pan every item (two-hand "move the whole canvas").
     translateAll(dx, dy) {
       for (let i = 0; i < this.list.length; i++) this.translate(i, dx, dy);
+    }
+    // Move several items together (bulk drag of a selection).
+    translateItems(indices, dx, dy) {
+      for (const i of indices) this.translate(i, dx, dy);
+    }
+    // Bounding box of one item (normalized), or null.
+    _itemBounds(i) {
+      const it = this.list[i];
+      if (!it) return null;
+      if (it.kind === "ellipse") return { minx: it.cx - it.rx, miny: it.cy - it.ry, maxx: it.cx + it.rx, maxy: it.cy + it.ry };
+      const pts = it.kind === "line" ? [it.a, it.b] : it.kind === "poly" ? it.pts : it.points;
+      let mnx = Infinity;
+      let mny = Infinity;
+      let mxx = -Infinity;
+      let mxy = -Infinity;
+      for (const p of pts) {
+        mnx = Math.min(mnx, p.x);
+        mny = Math.min(mny, p.y);
+        mxx = Math.max(mxx, p.x);
+        mxy = Math.max(mxy, p.y);
+      }
+      return mnx === Infinity ? null : { minx: mnx, miny: mny, maxx: mxx, maxy: mxy };
+    }
+    // Indices of items whose CENTRE falls inside the rectangle (marquee select).
+    selectInRect(x0, y0, x1, y1) {
+      const lx = Math.min(x0, x1);
+      const hx = Math.max(x0, x1);
+      const ly = Math.min(y0, y1);
+      const hy = Math.max(y0, y1);
+      const out = [];
+      for (let i = 0; i < this.list.length; i++) {
+        const c = this.itemCenter(i);
+        if (c && c.x >= lx && c.x <= hx && c.y >= ly && c.y <= hy) out.push(i);
+      }
+      return out;
+    }
+    // Bounding box of a set of items (the selection outline), or null.
+    itemsBounds(indices) {
+      let mnx = Infinity;
+      let mny = Infinity;
+      let mxx = -Infinity;
+      let mxy = -Infinity;
+      for (const i of indices) {
+        const b = this._itemBounds(i);
+        if (!b) continue;
+        mnx = Math.min(mnx, b.minx);
+        mny = Math.min(mny, b.miny);
+        mxx = Math.max(mxx, b.maxx);
+        mxy = Math.max(mxy, b.maxy);
+      }
+      return mnx === Infinity ? null : { minx: mnx, miny: mny, maxx: mxx, maxy: mxy };
     }
     // Remove points within r of p; splits strokes, deletes shapes it touches.
     // Returns true if anything was actually removed (so callers can gate undo).
@@ -1051,7 +1172,7 @@
     }
   }
 
-  const api = { GestureController, Strokes, OneEuro, SwipeDetector, FistClench, UndoHistory, fivePinch, isFist, handOpenness, isShake, recognizeShape, rdp, transformPoint, twoHandDelta, depthTransform };
+  const api = { GestureController, Strokes, OneEuro, SwipeDetector, FistClench, DoubleTap, UndoHistory, fivePinch, isFist, handOpenness, fingerExtended, thumbExtended, thumbDist, isShake, recognizeShape, rdp, transformPoint, twoHandDelta, depthTransform };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   if (root) root.DrawMeEngine = api;
 })(typeof window !== "undefined" ? window : null);

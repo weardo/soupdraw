@@ -10,17 +10,23 @@ const DEFAULTS = {
   enabled: true,
   active: true, // drawing armed? (gestures only interpreted when true)
   mirror: true,
+  preview: false, // on-page panel showing exactly what viewers receive
   boost: true,
   assist: true,
-  debug: true,
+  debug: false, // gesture overlay is drawn on the OUTPUT — off by default so viewers don't see it
   minimap: true,
   history: true,
   spotlight: true,
+  hideCamera: false,
+  boardColor: "#14151a",
   color: "#ff2d55",
   size: 6,
   clearNonce: 0,
   undoNonce: 0,
   redoNonce: 0,
+  calibNonce: 0,
+  pinchDown: null,
+  pinchUp: null,
 };
 
 const ORIGIN = window.location.origin === "null" ? "*" : window.location.origin;
@@ -57,6 +63,11 @@ window.addEventListener("message", (e) => {
   // Pipeline reports a changed board → persist it (best-effort, latest wins).
   if (msg.__drawme === "persist" && msg.drawing) {
     api.storage.local.set({ drawing: msg.drawing });
+  }
+
+  // Pipeline finished calibration → save the measured pinch thresholds.
+  if (msg.__drawme === "calibrated" && msg.thresholds) {
+    loadSettings().then((s) => api.storage.local.set({ settings: { ...s, ...msg.thresholds } }));
   }
 
   // Pipeline reports live status; stash it so the popup can read it.

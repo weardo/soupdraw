@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="onboard.css" />
+    <title>Welcome to SoupDraw</title>
+  </head>
+  <body>
+    <main>
+      <header class="hero">
+        <div class="logo">Soup<span>Draw</span></div>
+        <h1>Draw on your camera with your hands.</h1>
+        <p class="sub">
+          Annotate any video call with hand gestures. Everything runs on your
+          device: no video, no frames, nothing ever leaves your machine.
+        </p>
+        <a class="cta" href="../train/train.html">▶ Practice the gestures</a>
+      </header>
+
+      <section class="steps">
+        <h2>Three steps to your first drawing</h2>
+        <ol>
+          <li>
+            <b>Turn it on.</b> Click the SoupDraw icon in your toolbar and switch
+            on <b>Augment my camera</b>.
+          </li>
+          <li>
+            <b>Join a call</b> (Meet, Zoom web, Teams, Whereby…) and pick your
+            normal camera. The call now receives your augmented feed.
+          </li>
+          <li>
+            <b>Arm and draw.</b> Press <span class="kbd" data-cmd="toggle-draw">Alt+Shift+D</span>
+            to arm, then pinch your thumb and index finger to draw. Press it
+            again before you talk.
+          </li>
+        </ol>
+      </section>
+
+      <section class="gestures">
+        <h2>Your gestures</h2>
+        <div class="grid" id="cheatsheet"></div>
+        <p class="note">
+          Rebind any gesture from the toolbar popup, under
+          <b>Gesture controls</b>.
+        </p>
+      </section>
+
+      <section class="safe">
+        <h2>Call-safe by design</h2>
+        <p>
+          Gestures are only read when <b>armed</b>. Disarm
+          (<span class="kbd" data-cmd="toggle-draw">Alt+Shift+D</span>) before you speak, so nothing is
+          interpreted while you gesture naturally. When the extension is off,
+          apps get your real camera, untouched.
+        </p>
+      </section>
+
+      <section class="shortcuts">
+        <h2>Keyboard shortcuts</h2>
+        <div class="grid">
+          <div class="card"><span class="kbd" data-cmd="toggle-draw">Alt+Shift+D</span><div class="body"><div class="how">Arm / disarm drawing</div></div></div>
+          <div class="card"><span class="kbd" data-cmd="undo">Alt+Shift+Z</span><div class="body"><div class="how">Undo</div></div></div>
+          <div class="card"><span class="kbd" data-cmd="redo">Alt+Shift+Y</span><div class="body"><div class="how">Redo</div></div></div>
+        </div>
+        <p class="note">Change these in <b>about:addons</b> → gear → Manage Extension Shortcuts.</p>
+      </section>
+
+      <footer>
+        <span>A <a href="https://soupup.ai" target="_blank" rel="noopener">Soup Up</a> tool · on-device · open source</span>
+      </footer>
+    </main>
+
+    <script src="../page/bindings.js"></script>
+    <script src="onboard.js"></script>
+  </body>
+</html>
