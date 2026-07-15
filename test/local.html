@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>draw.me — pipeline test harness</title>
+    <style>
+      body {
+        margin: 0; font-family: system-ui, sans-serif; background: #14151a; color: #eceef4;
+        display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 24px;
+      }
+      h1 { font-size: 20px; margin: 0; }
+      h1 span { color: #ff2d55; }
+      p.note { color: #969bad; max-width: 640px; text-align: center; font-size: 13px; line-height: 1.6; }
+      .stage {
+        display: flex; gap: 20px; align-items: flex-start;
+        justify-content: center; flex-wrap: wrap; width: 100%;
+      }
+      video {
+        display: block;
+        width: min(640px, 92vw);
+        height: auto;            /* follow the stream's real aspect ratio */
+        border-radius: 12px; background: #000; border: 1px solid #2b2e3a;
+      }
+      /* Local preview mirrored (selfie view) so moving right feels right.
+         When the extension is ON its canvas is already mirrored, so drop this
+         class to avoid a double-flip. */
+      video.mirror { transform: scaleX(-1); }
+      .bar { display: flex; gap: 10px; align-items: center; }
+      button {
+        padding: 10px 16px; border-radius: 8px; border: 1px solid #2b2e3a;
+        background: #1d1f27; color: #eceef4; font-size: 14px; cursor: pointer;
+      }
+      button:hover { border-color: #ff2d55; color: #ff2d55; }
+      #log { font-family: ui-monospace, monospace; font-size: 12px; color: #969bad; white-space: pre-wrap; }
+      .legend {
+        display: grid; grid-template-columns: auto 1fr; gap: 10px 14px; align-items: center;
+        background: #1d1f27; border: 1px solid #2b2e3a; border-radius: 12px;
+        padding: 16px 20px; width: 260px; max-width: 92vw; align-self: stretch;
+      }
+      .legend h2 { grid-column: 1 / -1; margin: 0 0 4px; font-size: 14px; color: #eceef4; }
+      .legend .ico { font-size: 22px; text-align: center; }
+      .legend .txt { font-size: 13px; }
+      .legend .txt b { color: #ff2d55; }
+      .legend .det { color: #969bad; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>draw<span>.me</span> · pipeline test harness</h1>
+    <p class="note">
+      This page just calls <code>getUserMedia({ video: true })</code> and shows whatever
+      stream comes back — exactly like a video-call app would. Enable the extension in its
+      popup, then click Start. If augmentation is on, the video below is the composited canvas
+      stream (your camera + gesture drawing). Pinch thumb + index to draw.
+    </p>
+    <div class="stage">
+      <video id="v" autoplay playsinline muted></video>
+      <section class="legend" id="legend"></section>
+    </div>
+    <div class="bar">
+      <button id="start">Start camera</button>
+      <button id="stop">Stop</button>
+    </div>
+    <div id="log">idle</div>
+
+    <script src="../src/page/bindings.js"></script>
+    <script src="local.js"></script>
+  </body>
+</html>

@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="popup.css" />
+    <title>draw.me</title>
+  </head>
+  <body>
+    <header>
+      <div class="logo">draw<span>.me</span></div>
+      <div class="tag">on-device · gesture drawing</div>
+    </header>
+
+    <section class="row main-toggle">
+      <div>
+        <div class="label">Augment my camera</div>
+        <div class="hint" id="enabledHint">Off — apps see your real camera</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="enabled" />
+        <span class="slider"></span>
+      </label>
+    </section>
+
+    <section class="row arm-toggle">
+      <div>
+        <div class="label">Arm drawing</div>
+        <div class="hint" id="armHint">Disarmed — gestures ignored (safe for calls)</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="active" />
+        <span class="slider"></span>
+      </label>
+    </section>
+
+    <section class="gestures-wrap">
+      <div class="section-label">
+        Controls · tap a gesture to rebind
+        <button id="resetBindings" class="linkbtn">Reset to defaults</button>
+      </div>
+      <div class="gestures" id="gestures"></div>
+    </section>
+
+    <section class="controls">
+      <div class="row">
+        <span class="label">Mirror (selfie view)</span>
+        <label class="switch small">
+          <input type="checkbox" id="mirror" checked />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="label">Low-light boost</div>
+          <div class="hint">Brightens tracking in the dark (not your video)</div>
+        </div>
+        <label class="switch small">
+          <input type="checkbox" id="boost" checked />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="label">Shape assist</div>
+          <div class="hint">Cleans up circles/lines/boxes you clearly meant</div>
+        </div>
+        <label class="switch small">
+          <input type="checkbox" id="assist" checked />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="label">Minimap</div>
+          <div class="hint">Overview of the whole drawing + the visible frame</div>
+        </div>
+        <label class="switch small">
+          <input type="checkbox" id="minimap" checked />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="label">History strip</div>
+          <div class="hint">Thumbnails of past drawings, auto-saved on each clear</div>
+        </div>
+        <label class="switch small">
+          <input type="checkbox" id="history" checked />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="label">Hand spotlight</div>
+          <div class="hint">Dims the feed + glows your detected hand (colors pop)</div>
+        </div>
+        <label class="switch small">
+          <input type="checkbox" id="spotlight" checked />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="label">Show gesture (debug)</div>
+          <div class="hint">On-screen overlay of what the model detects</div>
+        </div>
+        <label class="switch small">
+          <input type="checkbox" id="debug" checked />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+
+      <div class="row">
+        <span class="label">Pen color</span>
+        <div class="swatches" id="swatches"></div>
+      </div>
+
+      <div class="row">
+        <span class="label">Pen size <b id="sizeVal">6</b></span>
+        <input type="range" id="size" min="2" max="24" value="6" />
+      </div>
+
+      <div class="row btns">
+        <button id="undo">↶ Undo</button>
+        <button id="redo">↷ Redo</button>
+      </div>
+      <button id="clear" class="clear">Clear drawing</button>
+    </section>
+
+    <section class="status" id="status">
+      <div class="dot" id="dot"></div>
+      <div class="status-text" id="statusText">Idle</div>
+    </section>
+
+    <footer>
+      <b>Arm drawing</b> only when you want to annotate — press
+      <b>Alt+Shift+D</b> to arm/disarm hands-free. Disarm before a call so
+      gestures aren't interpreted while you talk.
+    </footer>
+
+    <script src="../page/bindings.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

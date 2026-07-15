@@ -1,0 +1,21 @@
+{
+  "name": "draw.me",
+  "version": "1.0.0",
+  "directories": {
+    "doc": "docs",
+    "test": "test"
+  },
+  "scripts": {
+    "test": "node --test test/engine.test.mjs",
+    "lint": "web-ext lint --no-config-discovery",
+    "serve": "python3 -m http.server 8123",
+    "start": "web-ext run --verbose"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "draw.me — augmented gesture drawing on your live camera feed (Firefox, on-device)",
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.35"
+  }
+}

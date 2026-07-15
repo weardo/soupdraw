@@ -1,0 +1,112 @@
+:root {
+  --bg: #14151a;
+  --panel: #1d1f27;
+  --line: #2b2e3a;
+  --text: #eceef4;
+  --muted: #969bad;
+  --accent: #ff2d55;
+  --ok: #35c759;
+  --off: #565b6e;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  width: 288px;
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  -moz-osx-font-smoothing: grayscale;
+}
+
+header {
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.logo { font-size: 18px; font-weight: 700; letter-spacing: -0.02em; }
+.logo span { color: var(--accent); }
+.tag { font-size: 11px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.06em; }
+
+section { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+
+.row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.row + .row { margin-top: 12px; }
+
+.label { font-size: 13px; font-weight: 500; }
+.hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+.main-toggle { background: var(--panel); }
+.arm-toggle { background: var(--panel); }
+.arm-toggle input:checked + .slider { background: var(--accent); }
+
+/* switch */
+.switch { position: relative; display: inline-block; width: 44px; height: 26px; flex: none; }
+.switch.small { width: 38px; height: 22px; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider {
+  position: absolute; inset: 0; cursor: pointer;
+  background: var(--off); border-radius: 999px; transition: 0.2s;
+}
+.slider::before {
+  content: ""; position: absolute; height: 20px; width: 20px; left: 3px; top: 3px;
+  background: #fff; border-radius: 50%; transition: 0.2s;
+}
+.switch.small .slider::before { height: 16px; width: 16px; }
+input:checked + .slider { background: var(--ok); }
+input:checked + .slider::before { transform: translateX(18px); }
+.switch.small input:checked + .slider::before { transform: translateX(16px); }
+
+/* gesture remap (user-defined controls) */
+.section-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.linkbtn { background: none; border: none; color: var(--accent); font-size: 11px; text-transform: none; letter-spacing: 0; cursor: pointer; padding: 0; }
+.linkbtn:hover { text-decoration: underline; }
+.gestures { display: flex; flex-direction: column; gap: 8px; }
+.gestures .g { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+.gestures .ico { font-size: 15px; width: 24px; text-align: center; flex: none; }
+.gestures .how { flex: 1; min-width: 0; }
+.gestures .bind {
+  flex: none; width: 116px; padding: 4px 6px; border-radius: 6px;
+  background: var(--bg); color: var(--text); border: 1px solid var(--line);
+  font-size: 12px; cursor: pointer;
+}
+.gestures .bind:hover { border-color: var(--accent); }
+
+/* swatches */
+.swatches { display: flex; gap: 6px; }
+.swatch {
+  width: 22px; height: 22px; border-radius: 50%; cursor: pointer;
+  border: 2px solid transparent; transition: transform 0.1s;
+}
+.swatch:hover { transform: scale(1.12); }
+.swatch.active { border-color: #fff; }
+
+/* range */
+input[type="range"] { width: 120px; accent-color: var(--accent); }
+#sizeVal { color: var(--accent); }
+
+/* clear */
+.clear {
+  margin-top: 14px; width: 100%; padding: 9px; border: 1px solid var(--line);
+  background: transparent; color: var(--text); border-radius: 8px; font-size: 13px;
+  cursor: pointer; transition: 0.15s;
+}
+.clear:hover { background: var(--panel); border-color: var(--accent); color: var(--accent); }
+
+/* undo / redo */
+.btns { display: flex; gap: 8px; margin-top: 12px; }
+.btns button {
+  flex: 1; padding: 8px; border: 1px solid var(--line); background: transparent;
+  color: var(--text); border-radius: 8px; font-size: 13px; cursor: pointer; transition: 0.15s;
+}
+.btns button:hover { background: var(--panel); border-color: var(--accent); color: var(--accent); }
+
+/* status */
+.status { display: flex; align-items: center; gap: 8px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; }
+.dot.live { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.dot.warn { background: #ffcc00; }
+.status-text { font-size: 12px; color: var(--muted); }
+
+footer { padding: 10px 16px; font-size: 11px; color: var(--muted); line-height: 1.5; }
+footer b { color: var(--text); }
